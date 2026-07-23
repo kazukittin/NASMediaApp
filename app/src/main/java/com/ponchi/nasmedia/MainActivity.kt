@@ -21,8 +21,6 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.animation.core.animateFloatAsState
@@ -229,7 +227,6 @@ private fun NasConnectionScreen(
     var audioEntries by remember { mutableStateOf<List<AudioEntry>>(emptyList()) }
     var audioStatus by remember { mutableStateOf("") }
     var audioIsLoading by remember { mutableStateOf(false) }
-    var openedAudioDetails by remember { mutableStateOf<AudioEntry?>(null) }
     var openedAudioPlaylist by remember { mutableStateOf<AudioPlaylist?>(null) }
     var status by remember { mutableStateOf("接続情報を入力してください") }
     var isLoading by remember { mutableStateOf(false) }
@@ -377,19 +374,6 @@ private fun NasConnectionScreen(
         return
     }
 
-    openedAudioDetails?.let { entry ->
-        DlsiteWorkDetailScreen(
-            entry = entry,
-            onOpenFolder = {
-                openedAudioDetails = null
-                openAudioDirectory(entry.path)
-            },
-            onBack = { openedAudioDetails = null },
-            modifier = modifier
-        )
-        return
-    }
-
     openedVideoPath?.let { video ->
         VideoPlayerScreen(
             videoPath = video,
@@ -514,13 +498,7 @@ private fun NasConnectionScreen(
             entries = audioEntries,
             status = audioStatus,
             isLoading = audioIsLoading,
-            onOpenFolder = { entry ->
-                if (findDlsiteProductId(entry.name) != null) {
-                    openedAudioDetails = entry
-                } else {
-                    openAudioDirectory(entry.path)
-                }
-            },
+            onOpenFolder = { entry -> openAudioDirectory(entry.path) },
             onOpenAudio = { selected ->
                 if (Build.VERSION.SDK_INT >= 33 &&
                     ContextCompat.checkSelfPermission(
@@ -1203,108 +1181,6 @@ private fun DlsiteFilterDialog(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun DlsiteWorkDetailScreen(
-    entry: AudioEntry,
-    onOpenFolder: () -> Unit,
-    onBack: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    var workInfo by remember(entry.path) { mutableStateOf<DlsiteWorkInfo?>(null) }
-    var coverBitmap by remember(entry.path) { mutableStateOf<Bitmap?>(null) }
-    var isLoading by remember(entry.path) { mutableStateOf(true) }
-
-    LaunchedEffect(entry.path) {
-        workInfo = loadDlsiteWorkInfo(context, entry.name)
-        coverBitmap = workInfo?.let { loadDlsiteCoverBitmap(context, it) }
-        isLoading = false
-    }
-    BackHandler(onBack = onBack)
-
-    Surface(modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        Column(
-            Modifier.fillMaxSize()
-                .windowInsetsPadding(WindowInsets.safeDrawing)
-                .verticalScroll(rememberScrollState())
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("作品情報", style = MaterialTheme.typography.headlineMedium)
-                Button(onClick = onBack) { Text("戻る") }
-            }
-
-            Box(
-                Modifier.fillMaxWidth().aspectRatio(1f)
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                contentAlignment = Alignment.Center
-            ) {
-                if (coverBitmap != null) {
-                    Image(
-                        bitmap = coverBitmap!!.asImageBitmap(),
-                        contentDescription = "DLsite作品画像",
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit
-                    )
-                } else if (isLoading) {
-                    CircularProgressIndicator()
-                } else {
-                    Text("作品画像なし", style = MaterialTheme.typography.titleLarge)
-                }
-            }
-
-            Text(
-                workInfo?.title ?: entry.name,
-                style = MaterialTheme.typography.headlineSmall
-            )
-            workInfo?.circleName?.takeIf(String::isNotBlank)?.let {
-                DetailValue("サークル", it)
-            }
-            DetailValue("作品番号", findDlsiteProductId(entry.name).orEmpty())
-            workInfo?.releaseDate?.takeIf(String::isNotBlank)?.let {
-                DetailValue("発売日", it)
-            }
-            workInfo?.voiceActors?.takeIf(List<String>::isNotEmpty)?.let {
-                DetailValue("声優", it.joinToString(" / "))
-            }
-            workInfo?.genres?.takeIf(List<String>::isNotEmpty)?.let {
-                DetailValue("ジャンル", it.joinToString("・"))
-            }
-            workInfo?.description?.takeIf(String::isNotBlank)?.let {
-                Text("作品紹介", style = MaterialTheme.typography.titleMedium)
-                Text(it, style = MaterialTheme.typography.bodyMedium)
-            }
-
-            Button(onClick = onOpenFolder, modifier = Modifier.fillMaxWidth()) {
-                Text("トラック一覧へ")
-            }
-            workInfo?.productUrl?.takeIf(String::isNotBlank)?.let { productUrl ->
-                TextButton(
-                    onClick = {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(productUrl)))
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("DLsiteで見る")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun DetailValue(label: String, value: String) {
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text(label, style = MaterialTheme.typography.labelMedium)
-        Text(value, style = MaterialTheme.typography.bodyLarge)
     }
 }
 
