@@ -253,7 +253,7 @@ private fun NasConnectionScreen(
     var audioStatus by remember { mutableStateOf("") }
     var audioIsLoading by remember { mutableStateOf(false) }
     var openedAudioPlaylist by remember { mutableStateOf<AudioPlaylist?>(null) }
-    var status by remember { mutableStateOf("接続情報を入力してください") }
+    var status by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
     var rememberLogin by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -271,7 +271,7 @@ private fun NasConnectionScreen(
 
     fun connectToNas() {
         if (server.isBlank() || username.isBlank() || password.isBlank()) {
-            status = "すべて入力してください"
+            status = "未入力の項目があります"
             return
         }
         isLoading = true
@@ -299,13 +299,9 @@ private fun NasConnectionScreen(
                 mangaFiles = files
                 isConnected = true
                 selectedSection = null
-                status = if (files.isEmpty()) {
-                    "接続成功。Manga直下にZIPはありません"
-                } else {
-                    "接続成功：${files.size}件。読みたいZIPをタップしてください"
-                }
+                status = if (files.isEmpty()) "MangaにZIPがありません" else ""
             }.onFailure {
-                status = "接続できませんでした。IP・ユーザー名・パスワードを確認してください"
+                status = "接続できません"
             }
             isLoading = false
         }
@@ -318,7 +314,7 @@ private fun NasConnectionScreen(
         }.onFailure {
             withContext(Dispatchers.IO) { SecureNasCredentials.clear(context) }
             hasSavedCredentials = false
-            status = "保存情報を読み込めなかったため削除しました"
+            status = "保存情報を削除しました"
         }.getOrNull() ?: return@LaunchedEffect
         server = saved.server
         username = saved.username
@@ -339,7 +335,7 @@ private fun NasConnectionScreen(
     fun openPhotoDirectory(path: String) {
         photoPath = path
         photoEntries = emptyList()
-        photoStatus = "読み込み中…"
+        photoStatus = ""
         photoIsLoading = true
         scope.launch {
             runCatching {
@@ -348,9 +344,9 @@ private fun NasConnectionScreen(
                 }
             }.onSuccess { entries ->
                 photoEntries = entries
-                photoStatus = if (entries.isEmpty()) "このフォルダは空です" else ""
+                photoStatus = if (entries.isEmpty()) "空のフォルダです" else ""
             }.onFailure {
-                photoStatus = "写真フォルダを読み込めませんでした"
+                photoStatus = "写真を読み込めません"
             }
             photoIsLoading = false
         }
@@ -359,7 +355,7 @@ private fun NasConnectionScreen(
     fun openVideoDirectory(path: String) {
         videoPath = path
         videoEntries = emptyList()
-        videoStatus = "読み込み中…"
+        videoStatus = ""
         videoIsLoading = true
         scope.launch {
             runCatching {
@@ -368,9 +364,9 @@ private fun NasConnectionScreen(
                 }
             }.onSuccess { entries ->
                 videoEntries = entries
-                videoStatus = if (entries.isEmpty()) "このフォルダは空です" else ""
+                videoStatus = if (entries.isEmpty()) "空のフォルダです" else ""
             }.onFailure {
-                videoStatus = "ビデオフォルダを読み込めませんでした"
+                videoStatus = "ビデオを読み込めません"
             }
             videoIsLoading = false
         }
@@ -379,7 +375,7 @@ private fun NasConnectionScreen(
     fun openAudioDirectory(path: String, autoAdvance: Boolean = true) {
         audioPath = path
         audioEntries = emptyList()
-        audioStatus = "読み込み中…"
+        audioStatus = ""
         audioIsLoading = true
         scope.launch {
             runCatching { withContext(Dispatchers.IO) {
@@ -396,8 +392,8 @@ private fun NasConnectionScreen(
             } }.onSuccess { directory ->
                 audioPath = directory.path
                 audioEntries = directory.entries
-                audioStatus = if (directory.entries.isEmpty()) "このフォルダは空です" else ""
-            }.onFailure { audioStatus = "音声フォルダを読み込めませんでした" }
+                audioStatus = if (directory.entries.isEmpty()) "空のフォルダです" else ""
+            }.onFailure { audioStatus = "音声を読み込めません" }
             audioIsLoading = false
         }
     }
@@ -470,9 +466,9 @@ private fun NasConnectionScreen(
                     isConnected = false
                     selectedSection = null
                     status = if (hadSavedCredentials) {
-                        "保存したログイン情報を削除して切断しました"
+                        "保存情報を削除しました"
                     } else {
-                        "NASから切断しました"
+                        "切断しました"
                     }
                 }
             },
@@ -593,12 +589,11 @@ private fun NasConnectionScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
         if (!isConnected) {
-            Text("NAS Media", style = MaterialTheme.typography.headlineMedium)
-            Text("自宅のNASへ接続")
+            Text("NAS Media", style = MaterialTheme.typography.titleLarge)
 
         OutlinedTextField(
             value = server,
@@ -694,30 +689,32 @@ private fun NasConnectionScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("マンガ", style = MaterialTheme.typography.headlineMedium)
-                Button(onClick = { selectedSection = null }) {
+                Text("マンガ", style = MaterialTheme.typography.titleLarge)
+                TextButton(onClick = { selectedSection = null }) {
                     Text("ホーム")
                 }
             }
         }
 
         if (isLoading) {
-            CircularProgressIndicator()
+            CircularProgressIndicator(Modifier.size(24.dp))
         }
-        Text(status)
+        if (status.isNotBlank()) {
+            Text(status, style = MaterialTheme.typography.bodySmall)
+        }
 
-            if (isConnected && selectedSection == MediaSection.MANGA) {
-                DlsiteLibraryFilterControls(
-                    candidates = mangaFiles.map {
-                        DlsiteFilterCandidate(it, mangaMetadata[it])
-                    },
-                    filters = mangaFilters,
-                    availableCategories = MANGA_FILTER_CATEGORIES,
-                    onFiltersChange = { mangaFilters = it }
-                )
-            }
+        if (isConnected && selectedSection == MediaSection.MANGA) {
+            DlsiteLibraryFilterControls(
+                candidates = mangaFiles.map {
+                    DlsiteFilterCandidate(it, mangaMetadata[it])
+                },
+                filters = mangaFilters,
+                availableCategories = MANGA_FILTER_CATEGORIES,
+                onFiltersChange = { mangaFilters = it }
+            )
+        }
 
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 val filteredMangaFiles = mangaFiles.filter { fileName ->
                     matchesDlsiteLibraryFilter(
                         displayName = fileName,
@@ -731,7 +728,7 @@ private fun NasConnectionScreen(
                             .fillMaxWidth()
                             .clickable(enabled = !isLoading) {
                             isLoading = true
-                            status = "「$fileName」を読み込み中…"
+                            status = "読み込み中…"
                             scope.launch {
                                 runCatching {
                                     withContext(Dispatchers.IO) {
@@ -749,9 +746,9 @@ private fun NasConnectionScreen(
                                         .putInt(pageCountKey(it.zipName), it.pageNames.size)
                                         .apply()
                                     openedBook = it
-                                    status = "接続成功"
+                                    status = ""
                                 }.onFailure {
-                                    status = "画像を開けませんでした。ZIP内にJPG・PNG・WEBPがあるか確認してください"
+                                    status = "ZIPを開けません"
                                 }
                                 isLoading = false
                             }
@@ -784,7 +781,7 @@ private fun MediaSearchField(
         trailingIcon = if (query.isNotEmpty()) {
             {
                 TextButton(onClick = { onQueryChange("") }) { Text("消去") }
-            }
+        }
         } else {
             null
         },
@@ -814,7 +811,7 @@ private fun LocationLabel(root: String, currentPath: String) {
         "$root › ${currentPath.replace("\\", " › ")}"
     }
     Text(
-        text = "現在地：$location",
+        text = location,
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )
@@ -928,21 +925,25 @@ private fun MediaHomeScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("NAS Media", style = MaterialTheme.typography.headlineMedium)
-            Text("$server に接続済み")
+            Text("NAS Media", style = MaterialTheme.typography.titleLarge)
+            Text(
+                server,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             LazyVerticalGrid(
                 columns = GridCells.Fixed(2),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 gridItems(MediaSection.entries) { section ->
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(140.dp)
+                            .height(120.dp)
                             .clickable { onSelect(section) }
                     ) {
                         Column(
@@ -986,12 +987,11 @@ private fun MediaPlaceholderScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(20.dp),
+                .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Text(section.title, style = MaterialTheme.typography.headlineMedium)
-            Text("この機能は次に実装します")
+            Text(section.title, style = MaterialTheme.typography.titleLarge)
             Button(
                 onClick = onBack,
                 modifier = Modifier.padding(top = 16.dp)
@@ -1031,12 +1031,13 @@ private fun AudioBrowserScreen(
     BackHandler(onBack = onBack)
     Surface(modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
-            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically) {
-                Text("音声", style = MaterialTheme.typography.headlineMedium)
+                Text("音声", style = MaterialTheme.typography.titleLarge)
                 Row {
                     TextButton(onClick = onRefresh, enabled = !isLoading) { Text("再読込") }
                     TextButton(onClick = onBack) {
@@ -1045,8 +1046,8 @@ private fun AudioBrowserScreen(
                 }
             }
             LocationLabel("Voice", currentPath)
-            if (isLoading) CircularProgressIndicator()
-            if (status.isNotEmpty()) Text(status)
+            if (isLoading) CircularProgressIndicator(Modifier.size(24.dp))
+            if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
             DlsiteLibraryFilterControls(
                 candidates = entries.map {
                     DlsiteFilterCandidate(it.name, metadataByPath[it.path])
@@ -1221,7 +1222,7 @@ private fun DlsiteFilterDialog(
                 verticalArrangement = Arrangement.spacedBy(0.dp)
             ) {
                 Row(
-                    Modifier.fillMaxWidth().height(58.dp).padding(horizontal = 8.dp),
+                    Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     TextButton(onClick = {
@@ -1472,9 +1473,10 @@ private fun AudioPlayerScreen(
     }
     Surface(modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
-            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(20.dp),
+            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Box(
                 Modifier.fillMaxWidth().aspectRatio(1f)
@@ -1568,15 +1570,15 @@ private fun VideoBrowserScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("ビデオ", style = MaterialTheme.typography.headlineMedium)
+                Text("ビデオ", style = MaterialTheme.typography.titleLarge)
                 Row {
                     TextButton(onClick = onRefresh, enabled = !isLoading) { Text("再読込") }
                     TextButton(onClick = onBack) {
@@ -1585,8 +1587,8 @@ private fun VideoBrowserScreen(
                 }
             }
             LocationLabel("video", currentPath)
-            if (isLoading) CircularProgressIndicator()
-            if (status.isNotEmpty()) Text(status)
+            if (isLoading) CircularProgressIndicator(Modifier.size(24.dp))
+            if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
             MediaSearchField(query, { query = it }, "ビデオ・フォルダを検索")
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 val filteredEntries = entries.filter { matchesSearch(query, it.name) }
@@ -1742,15 +1744,15 @@ private fun PhotoBrowserScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("写真", style = MaterialTheme.typography.headlineMedium)
+                Text("写真", style = MaterialTheme.typography.titleLarge)
                 Row {
                     TextButton(onClick = onRefresh, enabled = !isLoading) { Text("再読込") }
                     TextButton(onClick = onBack) {
@@ -1759,8 +1761,8 @@ private fun PhotoBrowserScreen(
                 }
             }
             LocationLabel("Picture", currentPath)
-            if (isLoading) CircularProgressIndicator()
-            if (status.isNotEmpty()) Text(status)
+            if (isLoading) CircularProgressIndicator(Modifier.size(24.dp))
+            if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
             MediaSearchField(query, { query = it }, "写真・フォルダを検索")
 
             LazyVerticalGrid(
@@ -2179,7 +2181,7 @@ private fun MangaReaderScreen(
                 style = MaterialTheme.typography.titleMedium
             )
             Text(
-                "左へ払う／右半分タップ：次　右へ払う／左半分タップ：前",
+                "左：前　右：次",
                 color = Color.White,
                 style = MaterialTheme.typography.bodySmall
             )
@@ -2208,7 +2210,7 @@ private fun MangaReaderScreen(
             )
             AlertDialog(
                 onDismissRequest = { showPageJumpDialog = false },
-                title = { Text("ページを選択（全${book.pageNames.size}ページ）") },
+                title = { Text("ページ移動 · ${book.pageNames.size}ページ") },
                 text = {
                     LazyColumn(state = pageListState) {
                         itemsIndexed(book.pageNames) { index, _ ->
