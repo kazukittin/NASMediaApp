@@ -71,6 +71,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -80,8 +81,14 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -159,6 +166,10 @@ private data class VideoEntry(
 )
 
 private data class AudioEntry(val name: String, val path: String, val isDirectory: Boolean)
+private data class ResolvedAudioDirectory(
+    val path: String,
+    val entries: List<AudioEntry>
+)
 private data class AudioPlaylist(
     val folderPath: String,
     val paths: List<String>,
@@ -184,6 +195,19 @@ private enum class DlsiteFilterCategory(val label: String) {
     RELEASE_YEAR("発売年")
 }
 
+private val MANGA_FILTER_CATEGORIES = setOf(
+    DlsiteFilterCategory.CIRCLE,
+    DlsiteFilterCategory.GENRE,
+    DlsiteFilterCategory.RELEASE_YEAR
+)
+
+private val AUDIO_FILTER_CATEGORIES = setOf(
+    DlsiteFilterCategory.CIRCLE,
+    DlsiteFilterCategory.VOICE_ACTOR,
+    DlsiteFilterCategory.GENRE,
+    DlsiteFilterCategory.RELEASE_YEAR
+)
+
 private data class DlsiteFilterCandidate(
     val displayName: String,
     val workInfo: DlsiteWorkInfo?
@@ -204,9 +228,10 @@ private fun NasConnectionScreen(
     cacheDirectory: LocalFile,
     modifier: Modifier = Modifier
 ) {
-    var server by remember { mutableStateOf("192.168.40.2") }
-    var username by remember { mutableStateOf("media_app") }
-    var password by remember { mutableStateOf("") }
+    var server by rememberSaveable { mutableStateOf("") }
+    var username by rememberSaveable { mutableStateOf("") }
+    var password by rememberSaveable { mutableStateOf("") }
+    var showPassword by rememberSaveable { mutableStateOf(false) }
     var mangaFiles by remember { mutableStateOf<List<String>>(emptyList()) }
     var mangaMetadata by remember { mutableStateOf<Map<String, DlsiteWorkInfo>>(emptyMap()) }
     var mangaFilters by remember { mutableStateOf(DlsiteLibraryFilters()) }
@@ -233,6 +258,7 @@ private fun NasConnectionScreen(
     var rememberLogin by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
     var hasSavedCredentials by remember {
         mutableStateOf(SecureNasCredentials.hasSaved(context))
     }
@@ -350,17 +376,27 @@ private fun NasConnectionScreen(
         }
     }
 
-    fun openAudioDirectory(path: String) {
+    fun openAudioDirectory(path: String, autoAdvance: Boolean = true) {
         audioPath = path
         audioEntries = emptyList()
         audioStatus = "読み込み中…"
         audioIsLoading = true
         scope.launch {
             runCatching { withContext(Dispatchers.IO) {
-                loadAudioEntries(server.trim(), username.trim(), password, path)
-            } }.onSuccess {
-                audioEntries = it
-                audioStatus = if (it.isEmpty()) "このフォルダは空です" else ""
+                if (autoAdvance) {
+                    resolveAudioDirectory(server.trim(), username.trim(), password, path)
+                } else {
+                    ResolvedAudioDirectory(
+                        path = path,
+                        entries = loadAudioEntries(
+                            server.trim(), username.trim(), password, path
+                        )
+                    )
+                }
+            } }.onSuccess { directory ->
+                audioPath = directory.path
+                audioEntries = directory.entries
+                audioStatus = if (directory.entries.isEmpty()) "このフォルダは空です" else ""
             }.onFailure { audioStatus = "音声フォルダを読み込めませんでした" }
             audioIsLoading = false
         }
@@ -425,6 +461,7 @@ private fun NasConnectionScreen(
                 if (section == MediaSection.AUDIO) openAudioDirectory("")
             },
             onForgetCredentials = {
+                val hadSavedCredentials = hasSavedCredentials
                 scope.launch {
                     withContext(Dispatchers.IO) { SecureNasCredentials.clear(context) }
                     hasSavedCredentials = false
@@ -432,7 +469,11 @@ private fun NasConnectionScreen(
                     password = ""
                     isConnected = false
                     selectedSection = null
-                    status = "保存したログイン情報を削除しました"
+                    status = if (hadSavedCredentials) {
+                        "保存したログイン情報を削除して切断しました"
+                    } else {
+                        "NASから切断しました"
+                    }
                 }
             },
             modifier = modifier
@@ -460,6 +501,7 @@ private fun NasConnectionScreen(
                         .coerceAtLeast(0)
                 )
             },
+            onRefresh = { openPhotoDirectory(photoPath) },
             onBack = {
                 if (photoPath.isEmpty()) {
                     selectedSection = null
@@ -480,6 +522,7 @@ private fun NasConnectionScreen(
             isLoading = videoIsLoading,
             onOpenFolder = ::openVideoDirectory,
             onOpenVideo = { openedVideoPath = it.path },
+            onRefresh = { openVideoDirectory(videoPath) },
             onBack = {
                 if (videoPath.isEmpty()) {
                     selectedSection = null
@@ -520,9 +563,10 @@ private fun NasConnectionScreen(
                     initialIndex = tracks.indexOfFirst { it.path == selected.path }.coerceAtLeast(0)
                 )
             },
+            onRefresh = { openAudioDirectory(audioPath, autoAdvance = false) },
             onBack = {
                 if (audioPath.isEmpty()) selectedSection = null
-                else openAudioDirectory(parentSmbPath(audioPath))
+                else openAudioDirectory(parentSmbPath(audioPath), autoAdvance = false)
             },
             modifier = modifier
         )
@@ -561,6 +605,11 @@ private fun NasConnectionScreen(
             onValueChange = { server = it },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("NASのIPアドレス") },
+            placeholder = { Text("例：192.168.1.10") },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Uri,
+                imeAction = ImeAction.Next
+            ),
             singleLine = true
         )
         OutlinedTextField(
@@ -568,6 +617,7 @@ private fun NasConnectionScreen(
             onValueChange = { username = it },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("専用ユーザー名") },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
             singleLine = true
         )
         OutlinedTextField(
@@ -575,7 +625,24 @@ private fun NasConnectionScreen(
             onValueChange = { password = it },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("パスワード") },
-            visualTransformation = PasswordVisualTransformation(),
+            visualTransformation = if (showPassword) {
+                VisualTransformation.None
+            } else {
+                PasswordVisualTransformation()
+            },
+            trailingIcon = {
+                TextButton(onClick = { showPassword = !showPassword }) {
+                    Text(if (showPassword) "隠す" else "表示")
+                }
+            },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                imeAction = ImeAction.Done
+            ),
+            keyboardActions = KeyboardActions(onDone = {
+                focusManager.clearFocus()
+                connectToNas()
+            }),
             singleLine = true
         )
 
@@ -593,7 +660,10 @@ private fun NasConnectionScreen(
                 Text("ログイン情報を保存")
             }
             Button(
-                onClick = ::connectToNas,
+                onClick = {
+                    focusManager.clearFocus()
+                    connectToNas()
+                },
                 enabled = !isLoading,
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -642,6 +712,7 @@ private fun NasConnectionScreen(
                         DlsiteFilterCandidate(it, mangaMetadata[it])
                     },
                     filters = mangaFilters,
+                    availableCategories = MANGA_FILTER_CATEGORIES,
                     onFiltersChange = { mangaFilters = it }
                 )
             }
@@ -696,6 +767,82 @@ private fun NasConnectionScreen(
             }
         }
     }
+}
+
+@Composable
+private fun MediaSearchField(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    label: String
+) {
+    val focusManager = LocalFocusManager.current
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text(label) },
+        trailingIcon = if (query.isNotEmpty()) {
+            {
+                TextButton(onClick = { onQueryChange("") }) { Text("消去") }
+            }
+        } else {
+            null
+        },
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus() }),
+        singleLine = true
+    )
+}
+
+@Composable
+private fun EmptySearchResult(onClear: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text("一致する項目がありません")
+        TextButton(onClick = onClear) { Text("検索をクリア") }
+    }
+}
+
+@Composable
+private fun LocationLabel(root: String, currentPath: String) {
+    val location = if (currentPath.isEmpty()) {
+        root
+    } else {
+        "$root › ${currentPath.replace("\\", " › ")}"
+    }
+    Text(
+        text = "現在地：$location",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
+
+private fun matchesSearch(
+    query: String,
+    name: String,
+    workInfo: DlsiteWorkInfo? = null
+): Boolean {
+    val terms = query.trim().split(Regex("\\s+")).filter(String::isNotEmpty)
+    if (terms.isEmpty()) return true
+    val searchableText = buildString {
+        append(name)
+        workInfo?.let {
+            append(' ')
+            append(it.productId)
+            append(' ')
+            append(it.title)
+            append(' ')
+            append(it.circleName)
+            append(' ')
+            append(it.voiceActors.joinToString(" "))
+            append(' ')
+            append(it.genres.joinToString(" "))
+        }
+    }
+    return terms.all { searchableText.contains(it, ignoreCase = true) }
 }
 
 @Composable
@@ -785,7 +932,7 @@ private fun MediaHomeScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("NAS Media", style = MaterialTheme.typography.headlineMedium)
-            Text("DS223j（$server）に接続済み")
+            Text("$server に接続済み")
             LazyVerticalGrid(
                 columns = GridCells.Fixed(2),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -813,13 +960,11 @@ private fun MediaHomeScreen(
                     }
                 }
             }
-            if (hasSavedCredentials) {
-                TextButton(
-                    onClick = onForgetCredentials,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("保存情報を削除してログアウト")
-                }
+            TextButton(
+                onClick = onForgetCredentials,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (hasSavedCredentials) "保存情報を削除して切断" else "NASから切断")
             }
         }
     }
@@ -865,6 +1010,7 @@ private fun AudioBrowserScreen(
     isLoading: Boolean,
     onOpenFolder: (AudioEntry) -> Unit,
     onOpenAudio: (AudioEntry) -> Unit,
+    onRefresh: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -891,9 +1037,14 @@ private fun AudioBrowserScreen(
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically) {
                 Text("音声", style = MaterialTheme.typography.headlineMedium)
-                Button(onClick = onBack) { Text(if (currentPath.isEmpty()) "ホーム" else "上のフォルダ") }
+                Row {
+                    TextButton(onClick = onRefresh, enabled = !isLoading) { Text("再読込") }
+                    TextButton(onClick = onBack) {
+                        Text(if (currentPath.isEmpty()) "ホーム" else "戻る")
+                    }
+                }
             }
-            Text(if (currentPath.isEmpty()) "Voice" else "Voice\\$currentPath")
+            LocationLabel("Voice", currentPath)
             if (isLoading) CircularProgressIndicator()
             if (status.isNotEmpty()) Text(status)
             DlsiteLibraryFilterControls(
@@ -901,6 +1052,7 @@ private fun AudioBrowserScreen(
                     DlsiteFilterCandidate(it.name, metadataByPath[it.path])
                 },
                 filters = filters,
+                availableCategories = AUDIO_FILTER_CATEGORIES,
                 onFiltersChange = { filters = it }
             )
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -935,6 +1087,7 @@ private fun AudioBrowserScreen(
 private fun DlsiteLibraryFilterControls(
     candidates: List<DlsiteFilterCandidate>,
     filters: DlsiteLibraryFilters,
+    availableCategories: Set<DlsiteFilterCategory>,
     onFiltersChange: (DlsiteLibraryFilters) -> Unit
 ) {
     var showDialog by remember { mutableStateOf(false) }
@@ -951,6 +1104,7 @@ private fun DlsiteLibraryFilterControls(
         DlsiteFilterDialog(
             candidates = candidates,
             currentFilters = filters,
+            availableCategories = availableCategories,
             onApply = {
                 onFiltersChange(it)
                 showDialog = false
@@ -987,6 +1141,7 @@ private fun matchesDlsiteLibraryFilter(
 private fun DlsiteFilterDialog(
     candidates: List<DlsiteFilterCandidate>,
     currentFilters: DlsiteLibraryFilters,
+    availableCategories: Set<DlsiteFilterCategory>,
     onApply: (DlsiteLibraryFilters) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -1110,7 +1265,9 @@ private fun DlsiteFilterDialog(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        items(DlsiteFilterCategory.entries) { item ->
+                        items(
+                            DlsiteFilterCategory.entries.filter { it in availableCategories }
+                        ) { item ->
                             Row(
                                 Modifier.fillMaxWidth()
                                     .background(MaterialTheme.colorScheme.surface)
@@ -1392,10 +1549,12 @@ private fun VideoBrowserScreen(
     isLoading: Boolean,
     onOpenFolder: (String) -> Unit,
     onOpenVideo: (VideoEntry) -> Unit,
+    onRefresh: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    var query by rememberSaveable(currentPath) { mutableStateOf("") }
     val videoProgress = remember {
         context.getSharedPreferences(VIDEO_PROGRESS_PREFERENCES, Context.MODE_PRIVATE)
     }
@@ -1418,15 +1577,23 @@ private fun VideoBrowserScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("ビデオ", style = MaterialTheme.typography.headlineMedium)
-                Button(onClick = onBack) {
-                    Text(if (currentPath.isEmpty()) "ホーム" else "上のフォルダ")
+                Row {
+                    TextButton(onClick = onRefresh, enabled = !isLoading) { Text("再読込") }
+                    TextButton(onClick = onBack) {
+                        Text(if (currentPath.isEmpty()) "ホーム" else "戻る")
+                    }
                 }
             }
-            Text(if (currentPath.isEmpty()) "video" else "video\\$currentPath")
+            LocationLabel("video", currentPath)
             if (isLoading) CircularProgressIndicator()
             if (status.isNotEmpty()) Text(status)
+            MediaSearchField(query, { query = it }, "ビデオ・フォルダを検索")
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(entries) { entry ->
+                val filteredEntries = entries.filter { matchesSearch(query, it.name) }
+                if (filteredEntries.isEmpty() && entries.isNotEmpty()) {
+                    item { EmptySearchResult(onClear = { query = "" }) }
+                }
+                items(filteredEntries) { entry ->
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1559,10 +1726,12 @@ private fun PhotoBrowserScreen(
     cacheDirectory: LocalFile,
     onOpenFolder: (String) -> Unit,
     onOpenPhoto: (PhotoEntry) -> Unit,
+    onRefresh: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val thumbnailSemaphore = remember { Semaphore(3) }
+    var query by rememberSaveable(currentPath) { mutableStateOf("") }
     BackHandler(onBack = onBack)
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -1582,13 +1751,17 @@ private fun PhotoBrowserScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("写真", style = MaterialTheme.typography.headlineMedium)
-                Button(onClick = onBack) {
-                    Text(if (currentPath.isEmpty()) "ホーム" else "上のフォルダ")
+                Row {
+                    TextButton(onClick = onRefresh, enabled = !isLoading) { Text("再読込") }
+                    TextButton(onClick = onBack) {
+                        Text(if (currentPath.isEmpty()) "ホーム" else "戻る")
+                    }
                 }
             }
-            Text(if (currentPath.isEmpty()) "Picture" else "Picture\\$currentPath")
+            LocationLabel("Picture", currentPath)
             if (isLoading) CircularProgressIndicator()
             if (status.isNotEmpty()) Text(status)
+            MediaSearchField(query, { query = it }, "写真・フォルダを検索")
 
             LazyVerticalGrid(
                 modifier = Modifier.weight(1f),
@@ -1596,7 +1769,11 @@ private fun PhotoBrowserScreen(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                gridItems(entries) { entry ->
+                val filteredEntries = entries.filter { matchesSearch(query, it.name) }
+                if (filteredEntries.isEmpty() && entries.isNotEmpty()) {
+                    item { EmptySearchResult(onClear = { query = "" }) }
+                }
+                gridItems(filteredEntries) { entry ->
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -2091,6 +2268,27 @@ private fun loadAudioEntries(
         }.toList()
 }
 
+private fun resolveAudioDirectory(
+    server: String,
+    username: String,
+    password: String,
+    initialPath: String
+): ResolvedAudioDirectory {
+    var path = initialPath
+    repeat(MAX_AUDIO_AUTO_ADVANCE_DEPTH) {
+        val entries = loadAudioEntries(server, username, password, path)
+        val onlyEntry = entries.singleOrNull()
+        if (onlyEntry == null || !onlyEntry.isDirectory) {
+            return ResolvedAudioDirectory(path, entries)
+        }
+        path = onlyEntry.path
+    }
+    return ResolvedAudioDirectory(
+        path = path,
+        entries = loadAudioEntries(server, username, password, path)
+    )
+}
+
 internal fun loadAudioCoverBitmap(
     server: String,
     username: String,
@@ -2404,6 +2602,7 @@ private val NATURAL_SORT_PARTS = Regex("\\d+|\\D+")
 private val PHOTO_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "heic", "heif")
 private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "webm", "mov", "m4v", "avi")
 private val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "flac", "ogg", "opus", "wav")
+private const val MAX_AUDIO_AUTO_ADVANCE_DEPTH = 12
 private const val SWIPE_THRESHOLD_PX = 80f
 private const val READING_PROGRESS_PREFERENCES = "reading_progress"
 private const val MANGA_CACHE_PREFERENCES = "manga_cache_metadata"

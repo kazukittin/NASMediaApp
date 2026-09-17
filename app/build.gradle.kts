@@ -22,6 +22,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".usability"
+            versionNameSuffix = "-usability"
+        }
         release {
             optimization {
                 enable = false
