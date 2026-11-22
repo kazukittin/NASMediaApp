@@ -130,8 +130,8 @@ private fun fetchDlsiteWorkInfo(productId: String): DlsiteWorkInfo {
             ?: metaContent(html, "twitter:image:src").orEmpty(),
         productUrl = metaContent(html, "og:url") ?: requestedUrl,
         releaseDate = outlineValue(html, "販売日").orEmpty(),
-        voiceActors = splitOutlineValues(outlineValue(html, "声優")),
-        genres = splitOutlineValues(outlineValue(html, "ジャンル"))
+        voiceActors = outlineListValues(html, "声優", splitOnSlash = true),
+        genres = outlineListValues(html, "ジャンル", splitOnSlash = false)
     )
 }
 
@@ -157,22 +157,57 @@ private fun metaContent(html: String, key: String): String? {
     return Html.fromHtml(value, Html.FROM_HTML_MODE_LEGACY).toString()
 }
 
-private fun outlineValue(html: String, label: String): String? {
-    val rawValue = Regex(
+private fun outlineRawValue(html: String, label: String): String? {
+    // 現在のDLsiteは <dt class="c-productInfo__key">ラベル</dt><dd class="c-productInfo__value">値</dd> 形式
+    val dtPattern = Regex(
+        "<dt[^>]*>\\s*${Regex.escape(label)}\\s*</dt>\\s*<dd[^>]*>([\\s\\S]*?)</dd>",
+        RegexOption.IGNORE_CASE
+    )
+    dtPattern.find(html)?.groupValues?.get(1)?.let { return it }
+    // 旧レイアウト（テーブル形式）のフォールバック
+    val thPattern = Regex(
         "<th[^>]*>\\s*${Regex.escape(label)}\\s*</th>[\\s\\S]*?<td[^>]*>([\\s\\S]*?)</td>",
         RegexOption.IGNORE_CASE
-    ).find(html)?.groupValues?.get(1) ?: return null
-    return Html.fromHtml(rawValue, Html.FROM_HTML_MODE_LEGACY)
+    )
+    return thPattern.find(html)?.groupValues?.get(1)
+}
+
+private fun stripHtmlFragment(raw: String): String {
+    val withoutComments = raw.replace(Regex("<!--[\\s\\S]*?-->"), " ")
+    return Html.fromHtml(withoutComments, Html.FROM_HTML_MODE_LEGACY)
         .toString()
         .replace(Regex("\\s+"), " ")
         .trim()
 }
 
-private fun splitOutlineValues(value: String?): List<String> = value
-    ?.split(Regex("\\s*(?:/|／)\\s*|\\s+"))
-    ?.map(String::trim)
-    ?.filter(String::isNotEmpty)
-    .orEmpty()
+private fun outlineValue(html: String, label: String): String? {
+    val rawValue = outlineRawValue(html, label) ?: return null
+    return stripHtmlFragment(rawValue)
+}
+
+private fun outlineListValues(
+    html: String,
+    label: String,
+    splitOnSlash: Boolean
+): List<String> {
+    val rawValue = outlineRawValue(html, label) ?: return emptyList()
+    // ジャンルや声優は値ごとに <a> リンクになっているので、リンク単位で拾うのが正確
+    val linkTexts = Regex("<a[^>]*>([\\s\\S]*?)</a>", RegexOption.IGNORE_CASE)
+        .findAll(rawValue)
+        .map { stripHtmlFragment(it.groupValues[1]) }
+        .filter(String::isNotEmpty)
+        .toList()
+    if (linkTexts.isNotEmpty()) return linkTexts.distinct()
+    val text = stripHtmlFragment(rawValue)
+    if (text.isEmpty()) return emptyList()
+    val parts = if (splitOnSlash) {
+        text.split(Regex("\\s*(?:/|／)\\s*|\\s+"))
+    } else {
+        // ジャンル名自体に「/」を含むものがあるため、空白でのみ区切る
+        text.split(Regex("\\s+"))
+    }
+    return parts.map(String::trim).filter(String::isNotEmpty).distinct()
+}
 
 private fun encodeCachedWorkInfo(info: DlsiteWorkInfo, fetchedAt: Long): String =
     JSONObject()
@@ -185,7 +220,7 @@ private fun encodeCachedWorkInfo(info: DlsiteWorkInfo, fetchedAt: Long): String 
         .put("releaseDate", info.releaseDate)
         .put("voiceActors", info.voiceActors.joinToString("\n"))
         .put("genres", info.genres.joinToString("\n"))
-        .put("schemaVersion", 2)
+        .put("schemaVersion", 3)
         .put("fetchedAt", fetchedAt)
         .toString()
 
@@ -201,5 +236,5 @@ private fun decodeCachedWorkInfo(json: String): Pair<DlsiteWorkInfo, Long>? = ru
         releaseDate = value.optString("releaseDate"),
         voiceActors = value.optString("voiceActors").lineSequence().filter(String::isNotBlank).toList(),
         genres = value.optString("genres").lineSequence().filter(String::isNotBlank).toList()
-    ) to if (value.optInt("schemaVersion") >= 2) value.optLong("fetchedAt") else 0L
+    ) to if (value.optInt("schemaVersion") >= 3) value.optLong("fetchedAt") else 0L
 }.getOrNull()
