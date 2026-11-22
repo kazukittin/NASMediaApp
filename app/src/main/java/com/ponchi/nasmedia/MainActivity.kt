@@ -412,6 +412,110 @@ private fun NasConnectionScreen(
         }
     }
 
+    fun selectSection(section: MediaSection?) {
+        if (section == selectedSection) return
+        selectedSection = section
+        if (section == MediaSection.PHOTOS) openPhotoDirectory("")
+        if (section == MediaSection.VIDEOS) openVideoDirectory("")
+        if (section == MediaSection.AUDIO) openAudioDirectory("")
+    }
+
+    // ミニプレイヤー用に MediaController をこの画面で保持する（AudioPlayerScreen とは別接続）
+    var miniController by remember { mutableStateOf<MediaController?>(null) }
+    var miniTitle by remember { mutableStateOf("") }
+    var miniIsPlaying by remember { mutableStateOf(false) }
+    var miniHasItem by remember { mutableStateOf(false) }
+    val miniControllerFuture = remember(context) {
+        MediaController.Builder(
+            context,
+            SessionToken(context, ComponentName(context, AudioPlaybackService::class.java))
+        ).buildAsync()
+    }
+    DisposableEffect(miniControllerFuture) {
+        miniControllerFuture.addListener(
+            { miniController = runCatching { miniControllerFuture.get() }.getOrNull() },
+            ContextCompat.getMainExecutor(context)
+        )
+        onDispose { MediaController.releaseFuture(miniControllerFuture) }
+    }
+    LaunchedEffect(miniController) {
+        val controller = miniController ?: return@LaunchedEffect
+        while (true) {
+            miniHasItem = controller.mediaItemCount > 0
+            miniTitle = controller.currentMediaItem?.mediaMetadata?.title?.toString()
+                ?: controller.currentMediaItem?.mediaId
+                    ?.substringAfterLast('\\')?.substringBeforeLast('.')
+                ?: ""
+            miniIsPlaying = controller.isPlaying
+            delay(500L)
+        }
+    }
+
+    val bottomBar: @Composable () -> Unit = {
+        if (isConnected) {
+            Column {
+                if (miniHasItem && openedAudioPlaylist == null) {
+                    Surface(color = MaterialTheme.colorScheme.surfaceVariant) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    AudioPlaybackRequestStore.request?.let { request ->
+                                        openedAudioPlaylist = AudioPlaylist(
+                                            folderPath = request.folderPath,
+                                            paths = request.paths,
+                                            initialIndex = request.initialIndex
+                                        )
+                                    }
+                                }
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                miniTitle.ifBlank { "音声を再生中" },
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                            TextButton(
+                                onClick = {
+                                    if (miniIsPlaying) miniController?.pause()
+                                    else miniController?.play()
+                                }
+                            ) {
+                                Text(if (miniIsPlaying) "一時停止" else "再生")
+                            }
+                        }
+                    }
+                }
+                NavigationBar {
+                    NavigationBarItem(
+                        selected = selectedSection == null,
+                        onClick = { selectSection(null) },
+                        icon = { Text("⌂") },
+                        label = { Text("ホーム") }
+                    )
+                    MediaSection.entries.forEach { section ->
+                        NavigationBarItem(
+                            selected = selectedSection == section,
+                            onClick = { selectSection(section) },
+                            icon = {
+                                Text(
+                                    when (section) {
+                                        MediaSection.MANGA -> "本"
+                                        MediaSection.PHOTOS -> "画"
+                                        MediaSection.VIDEOS -> "映"
+                                        MediaSection.AUDIO -> "音"
+                                    }
+                                )
+                            },
+                            label = { Text(section.title) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     fun connectToNas() {
         if (server.isBlank() || username.isBlank() || password.isBlank()) {
             status = "未入力の項目があります"
@@ -617,12 +721,7 @@ private fun NasConnectionScreen(
                     refreshMangaCacheSize()
                 }
             },
-            onSelect = { section ->
-                selectedSection = section
-                if (section == MediaSection.PHOTOS) openPhotoDirectory("")
-                if (section == MediaSection.VIDEOS) openVideoDirectory("")
-                if (section == MediaSection.AUDIO) openAudioDirectory("")
-            },
+            onSelect = { section -> selectSection(section) },
             onForgetCredentials = {
                 val hadSavedCredentials = hasSavedCredentials
                 scope.launch {
@@ -639,7 +738,8 @@ private fun NasConnectionScreen(
                     }
                 }
             },
-            modifier = modifier
+            modifier = modifier,
+            bottomBar = bottomBar
         )
         return
     }
@@ -665,6 +765,7 @@ private fun NasConnectionScreen(
                 )
             },
             onRefresh = { openPhotoDirectory(photoPath) },
+            bottomBar = bottomBar,
             onBack = {
                 if (photoPath.isEmpty()) {
                     selectedSection = null
@@ -692,6 +793,7 @@ private fun NasConnectionScreen(
                 openedVideoPath = entry.path
             },
             onRefresh = { openVideoDirectory(videoPath) },
+            bottomBar = bottomBar,
             onBack = {
                 if (videoPath.isEmpty()) {
                     selectedSection = null
@@ -740,6 +842,7 @@ private fun NasConnectionScreen(
                 )
             },
             onRefresh = { openAudioDirectory(audioPath, autoAdvance = false) },
+            bottomBar = bottomBar,
             onBack = {
                 if (audioPath.isEmpty()) selectedSection = null
                 else openAudioDirectory(parentSmbPath(audioPath), autoAdvance = false)
@@ -988,7 +1091,54 @@ private fun NasConnectionScreen(
                     }
                 }
             }
+        if (isConnected) {
+            bottomBar()
         }
+        }
+    }
+}
+
+@Composable
+private fun LibrarySortControl(
+    sort: LibrarySort,
+    onSortChange: (LibrarySort) -> Unit
+) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        LibrarySort.entries.forEach { option ->
+            FilterChip(
+                selected = sort == option,
+                onClick = { onSortChange(option) },
+                label = { Text(option.label) }
+            )
+        }
+    }
+}
+
+private fun <T> sortByName(
+    entries: List<T>,
+    sort: LibrarySort,
+    isDirectory: (T) -> Boolean,
+    name: (T) -> String
+): List<T> = entries.sortedWith { left, right ->
+    val leftDir = isDirectory(left)
+    val rightDir = isDirectory(right)
+    when {
+        leftDir && !rightDir -> -1
+        !leftDir && rightDir -> 1
+        sort == LibrarySort.NAME_ASC -> compareNaturally(name(left), name(right))
+        else -> compareNaturally(name(right), name(left))
+    }
+}
+
+@Composable
+private fun EmptyLibraryState(message: String, onRefresh: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(message)
+        Button(onClick = onRefresh) { Text("再読み込み") }
     }
 }
 
@@ -1381,10 +1531,12 @@ private fun AudioBrowserScreen(
     onOpenAudio: (AudioEntry) -> Unit,
     onRefresh: () -> Unit,
     onBack: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    bottomBar: @Composable () -> Unit = {}
 ) {
     val context = LocalContext.current
     var filters by remember(currentPath) { mutableStateOf(DlsiteLibraryFilters()) }
+    var sort by remember(currentPath) { mutableStateOf(LibrarySort.NAME_ASC) }
     var metadataByPath by remember(currentPath) {
         mutableStateOf<Map<String, DlsiteWorkInfo>>(emptyMap())
     }
@@ -1425,13 +1577,30 @@ private fun AudioBrowserScreen(
                 availableCategories = AUDIO_FILTER_CATEGORIES,
                 onFiltersChange = { filters = it }
             )
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                val filteredEntries = entries.filter { entry ->
-                    matchesDlsiteLibraryFilter(
-                        displayName = entry.name,
-                        workInfo = metadataByPath[entry.path],
-                        filters = filters
-                    )
+            LibrarySortControl(sort) { sort = it }
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val filteredEntries = sortByName(
+                    entries.filter { entry ->
+                        matchesDlsiteLibraryFilter(
+                            displayName = entry.name,
+                            workInfo = metadataByPath[entry.path],
+                            filters = filters
+                        )
+                    },
+                    sort,
+                    { it.isDirectory },
+                    { it.name }
+                )
+                if (entries.isEmpty() && !isLoading) {
+                    item {
+                        EmptyLibraryState(
+                            status.ifBlank { "空のフォルダです" },
+                            onRefresh
+                        )
+                    }
                 }
                 items(filteredEntries) { entry ->
                     Card(Modifier.fillMaxWidth().clickable(enabled = !isLoading) {
@@ -1449,6 +1618,7 @@ private fun AudioBrowserScreen(
                     }
                 }
             }
+            bottomBar()
         }
     }
 }
@@ -1777,7 +1947,7 @@ private fun AudioPlayerScreen(
     var volume by remember(playlist) { mutableStateOf(1f) }
     var coverBitmap by remember(playlist) { mutableStateOf<Bitmap?>(null) }
     val controllerFuture = remember(playlist, server, username, password) {
-        AudioPlaybackRequestStore.request = AudioPlaybackRequest(
+        val newRequest = AudioPlaybackRequest(
             server,
             username,
             password,
@@ -1785,11 +1955,15 @@ private fun AudioPlayerScreen(
             playlist.paths,
             playlist.initialIndex
         )
-        ContextCompat.startForegroundService(
-            context,
-            Intent(context, AudioPlaybackService::class.java)
-                .setAction(AudioPlaybackService.ACTION_LOAD_PLAYLIST)
-        )
+        // ミニプレイヤーから同じプレイリストを開き直した場合は読み込み直さず、再生位置を維持する
+        if (AudioPlaybackRequestStore.request != newRequest) {
+            AudioPlaybackRequestStore.request = newRequest
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, AudioPlaybackService::class.java)
+                    .setAction(AudioPlaybackService.ACTION_LOAD_PLAYLIST)
+            )
+        }
         MediaController.Builder(
             context,
             SessionToken(context, ComponentName(context, AudioPlaybackService::class.java))
@@ -1922,10 +2096,12 @@ private fun VideoBrowserScreen(
     onOpenVideo: (VideoEntry) -> Unit,
     onRefresh: () -> Unit,
     onBack: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    bottomBar: @Composable () -> Unit = {}
 ) {
     val context = LocalContext.current
     var query by rememberSaveable(currentPath) { mutableStateOf("") }
+    var sort by rememberSaveable(currentPath) { mutableStateOf(LibrarySort.NAME_ASC) }
     val videoProgress = remember {
         context.getSharedPreferences(VIDEO_PROGRESS_PREFERENCES, Context.MODE_PRIVATE)
     }
@@ -1959,8 +2135,25 @@ private fun VideoBrowserScreen(
             if (isLoading) CircularProgressIndicator(Modifier.size(24.dp))
             if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
             MediaSearchField(query, { query = it }, "ビデオ・フォルダを検索")
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                val filteredEntries = entries.filter { matchesSearch(query, it.name) }
+            LibrarySortControl(sort) { sort = it }
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val filteredEntries = sortByName(
+                    entries.filter { matchesSearch(query, it.name) },
+                    sort,
+                    { it.isDirectory },
+                    { it.name }
+                )
+                if (entries.isEmpty() && !isLoading) {
+                    item {
+                        EmptyLibraryState(
+                            status.ifBlank { "空のフォルダです" },
+                            onRefresh
+                        )
+                    }
+                }
                 if (filteredEntries.isEmpty() && entries.isNotEmpty()) {
                     item { EmptySearchResult(onClear = { query = "" }) }
                 }
@@ -1995,6 +2188,7 @@ private fun VideoBrowserScreen(
                     }
                 }
             }
+            bottomBar()
         }
     }
 }
@@ -2099,10 +2293,12 @@ private fun PhotoBrowserScreen(
     onOpenPhoto: (PhotoEntry) -> Unit,
     onRefresh: () -> Unit,
     onBack: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    bottomBar: @Composable () -> Unit = {}
 ) {
     val thumbnailSemaphore = remember { Semaphore(3) }
     var query by rememberSaveable(currentPath) { mutableStateOf("") }
+    var sort by rememberSaveable(currentPath) { mutableStateOf(LibrarySort.NAME_ASC) }
     BackHandler(onBack = onBack)
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -2133,6 +2329,7 @@ private fun PhotoBrowserScreen(
             if (isLoading) CircularProgressIndicator(Modifier.size(24.dp))
             if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
             MediaSearchField(query, { query = it }, "写真・フォルダを検索")
+            LibrarySortControl(sort) { sort = it }
 
             LazyVerticalGrid(
                 modifier = Modifier.weight(1f),
@@ -2140,7 +2337,20 @@ private fun PhotoBrowserScreen(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                val filteredEntries = entries.filter { matchesSearch(query, it.name) }
+                val filteredEntries = sortByName(
+                    entries.filter { matchesSearch(query, it.name) },
+                    sort,
+                    { it.isDirectory },
+                    { it.name }
+                )
+                if (entries.isEmpty() && !isLoading) {
+                    item {
+                        EmptyLibraryState(
+                            status.ifBlank { "空のフォルダです" },
+                            onRefresh
+                        )
+                    }
+                }
                 if (filteredEntries.isEmpty() && entries.isNotEmpty()) {
                     item { EmptySearchResult(onClear = { query = "" }) }
                 }
@@ -2186,6 +2396,7 @@ private fun PhotoBrowserScreen(
                     }
                 }
             }
+            bottomBar()
         }
     }
 }
