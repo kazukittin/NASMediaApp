@@ -23,6 +23,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -189,10 +191,11 @@ internal data class ResolvedAudioDirectory(
     val path: String,
     val entries: List<AudioEntry>
 )
-private data class AudioPlaylist(
+internal data class AudioPlaylist(
     val folderPath: String,
     val paths: List<String>,
-    val initialIndex: Int
+    val initialIndex: Int,
+    val resumePositionMs: Long = 0L
 )
 
 private data class DlsiteLibraryFilters(
@@ -309,6 +312,9 @@ private fun NasConnectionScreen(
     }
     val videoProgressPreferences = remember {
         context.getSharedPreferences(VIDEO_PROGRESS_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    val audioStatePreferences = remember {
+        context.getSharedPreferences(AUDIO_STATE_PREFERENCES, Context.MODE_PRIVATE)
     }
     var recentItems by remember { mutableStateOf(loadRecentItems(recentPreferences)) }
     var mangaSort by remember { mutableStateOf(LibrarySort.NAME_ASC) }
@@ -897,10 +903,19 @@ private fun NasConnectionScreen(
                 )
                 refreshRecentItems()
                 val tracks = audioEntries.filterNot { it.isDirectory }
+                val trackPaths = tracks.map { it.path }
+                val savedQueue = loadAudioQueue(audioStatePreferences, audioPath)
+                    ?.takeIf { queue ->
+                        queue.positionMs > 0L &&
+                            queue.trackIndex in trackPaths.indices &&
+                            trackPaths[queue.trackIndex] == queue.trackPath
+                    }
                 openedAudioPlaylist = AudioPlaylist(
                     folderPath = audioPath,
-                    paths = tracks.map { it.path },
-                    initialIndex = tracks.indexOfFirst { it.path == selected.path }.coerceAtLeast(0)
+                    paths = trackPaths,
+                    initialIndex = savedQueue?.trackIndex
+                        ?: tracks.indexOfFirst { it.path == selected.path }.coerceAtLeast(0),
+                    resumePositionMs = savedQueue?.positionMs ?: 0L
                 )
             },
             onRefresh = { openAudioDirectory(audioPath, autoAdvance = false) },
@@ -1964,162 +1979,9 @@ private fun DlsiteAudioFolderContent(entry: AudioEntry) {
     }
 }
 
-@Composable
-private fun AudioPlayerScreen(
-    playlist: AudioPlaylist,
-    server: String,
-    username: String,
-    password: String,
-    onBack: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    var currentIndex by remember(playlist) { mutableIntStateOf(playlist.initialIndex) }
     var position by remember(playlist) { mutableStateOf(0L) }
     var duration by remember(playlist) { mutableStateOf(0L) }
     var isPlaying by remember(playlist) { mutableStateOf(false) }
-    var volume by remember(playlist) { mutableStateOf(1f) }
-    var coverBitmap by remember(playlist) { mutableStateOf<Bitmap?>(null) }
-    val controllerFuture = remember(playlist, server, username, password) {
-        val newRequest = AudioPlaybackRequest(
-            server,
-            username,
-            password,
-            playlist.folderPath,
-            playlist.paths,
-            playlist.initialIndex
-        )
-        // ミニプレイヤーから同じプレイリストを開き直した場合は読み込み直さず、再生位置を維持する
-        if (AudioPlaybackRequestStore.request != newRequest) {
-            AudioPlaybackRequestStore.request = newRequest
-            ContextCompat.startForegroundService(
-                context,
-                Intent(context, AudioPlaybackService::class.java)
-                    .setAction(AudioPlaybackService.ACTION_LOAD_PLAYLIST)
-            )
-        }
-        MediaController.Builder(
-            context,
-            SessionToken(context, ComponentName(context, AudioPlaybackService::class.java))
-        ).buildAsync()
-    }
-    var connectedPlayer by remember { mutableStateOf<MediaController?>(null) }
-    DisposableEffect(controllerFuture) {
-        controllerFuture.addListener(
-            { connectedPlayer = runCatching { controllerFuture.get() }.getOrNull() },
-            ContextCompat.getMainExecutor(context)
-        )
-        onDispose { MediaController.releaseFuture(controllerFuture) }
-    }
-    val player: Player = connectedPlayer ?: run {
-        Surface(modifier.fillMaxSize()) {
-            Box(contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-        }
-        return
-    }
-    LaunchedEffect(playlist.folderPath) {
-        coverBitmap = runCatching {
-            loadPreferredAudioCoverBitmap(
-                context,
-                server,
-                username,
-                password,
-                playlist.folderPath
-            )
-        }.getOrNull()
-    }
-    LaunchedEffect(player) {
-        while (true) {
-            currentIndex = player.currentMediaItemIndex.coerceAtLeast(0)
-            position = player.currentPosition.coerceAtLeast(0L)
-            duration = player.duration.takeIf { it > 0L } ?: 0L
-            isPlaying = player.isPlaying
-            volume = player.volume
-            delay(250L)
-        }
-    }
-    BackHandler(onBack = onBack)
-    DisposableEffect(player) {
-        val listener = object : Player.Listener {
-            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                currentIndex = player.currentMediaItemIndex.coerceAtLeast(0)
-            }
-        }
-        player.addListener(listener)
-        onDispose { player.removeListener(listener) }
-    }
-    Surface(modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        Column(
-            Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Box(
-                Modifier.fillMaxWidth().aspectRatio(1f)
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                contentAlignment = Alignment.Center
-            ) {
-                if (coverBitmap != null) {
-                    Image(
-                        bitmap = coverBitmap!!.asImageBitmap(),
-                        contentDescription = "作品画像",
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit
-                    )
-                } else {
-                    Text("作品画像なし", style = MaterialTheme.typography.titleLarge)
-                }
-            }
-            Text(
-                playlist.paths.getOrNull(currentIndex)?.substringAfterLast('\\').orEmpty(),
-                style = MaterialTheme.typography.titleLarge
-            )
-            Slider(
-                value = position.coerceAtMost(duration).toFloat(),
-                onValueChange = { position = it.toLong() },
-                onValueChangeFinished = { player.seekTo(position) },
-                valueRange = 0f..duration.coerceAtLeast(1L).toFloat(),
-                modifier = Modifier.fillMaxWidth()
-            )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(formatPlaybackTime(position))
-                Text(formatPlaybackTime(duration))
-            }
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                TextButton(onClick = { player.seekToPreviousMediaItem() },
-                    enabled = currentIndex > 0) { Text("|◀") }
-                TextButton(onClick = { player.seekTo((player.currentPosition - 5_000L).coerceAtLeast(0L)) }) {
-                    Text("↶5")
-                }
-                Button(onClick = { if (player.isPlaying) player.pause() else player.play() }) {
-                    Text(if (isPlaying) "一時停止" else "再生")
-                }
-                TextButton(onClick = { player.seekTo(player.currentPosition + 30_000L) }) {
-                    Text("30↷")
-                }
-                TextButton(onClick = { player.seekToNextMediaItem() },
-                    enabled = currentIndex < playlist.paths.lastIndex) { Text("▶|") }
-            }
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("音量")
-                Slider(
-                    value = volume,
-                    onValueChange = { volume = it; player.volume = it },
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-    }
-}
-
 @Composable
 private fun VideoBrowserScreen(
     currentPath: String,
@@ -2738,6 +2600,18 @@ private fun MangaReaderScreen(
     )
 
     BackHandler(onBack = onBack)
+
+    // 音量キーでページ送り（音量＋＝次、音量－＝前）。リーダーを閉じると解除される
+    DisposableEffect(book) {
+        MangaVolumeKeyHandler.handler = { next ->
+            if (next) {
+                if (currentPage < book.pageNames.lastIndex) currentPage++
+            } else if (currentPage > 0) {
+                currentPage--
+            }
+        }
+        onDispose { MangaVolumeKeyHandler.handler = null }
+    }
 
     DisposableEffect(activity) {
         val insetsController = activity?.let {
