@@ -64,6 +64,9 @@ internal fun AudioPlayerScreen(
     var currentIndex by remember(playlist) { mutableIntStateOf(playlist.initialIndex) }
     var volume by remember(playlist) { mutableStateOf(1f) }
     var coverBitmap by remember(playlist) { mutableStateOf<Bitmap?>(null) }
+    var position by remember(playlist) { mutableStateOf(0L) }
+    var duration by remember(playlist) { mutableStateOf(0L) }
+    var isPlaying by remember(playlist) { mutableStateOf(false) }
     val audioState = remember {
         context.getSharedPreferences(AUDIO_STATE_PREFERENCES, Context.MODE_PRIVATE)
     }
