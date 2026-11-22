@@ -1979,9 +1979,6 @@ private fun DlsiteAudioFolderContent(entry: AudioEntry) {
     }
 }
 
-    var position by remember(playlist) { mutableStateOf(0L) }
-    var duration by remember(playlist) { mutableStateOf(0L) }
-    var isPlaying by remember(playlist) { mutableStateOf(false) }
 @Composable
 private fun VideoBrowserScreen(
     currentPath: String,
