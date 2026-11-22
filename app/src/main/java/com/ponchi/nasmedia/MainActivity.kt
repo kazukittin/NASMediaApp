@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Bundle
+import android.view.KeyEvent
 import android.net.Uri
 import android.content.ComponentName
 import android.content.Intent
@@ -135,6 +136,18 @@ import java.util.EnumSet
 import java.util.zip.ZipFile
 
 class MainActivity : ComponentActivity() {
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // マンガリーダー表示中のみ音量キーでページ送りする
+        val handler = MangaVolumeKeyHandler.handler
+        if (handler != null &&
+            (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
+        ) {
+            handler(keyCode == KeyEvent.KEYCODE_VOLUME_UP)
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -236,7 +249,7 @@ internal data class RecentItem(
     val timestamp: Long
 )
 
-private enum class LibrarySort(val label: String) {
+internal enum class LibrarySort(val label: String) {
     NAME_ASC("名前順（昇順）"),
     NAME_DESC("名前順（降順）")
 }
@@ -303,15 +316,40 @@ private fun NasConnectionScreen(
     var mangaDownloadPercent by remember { mutableStateOf(-1) }
     var mangaDownloadControl by remember { mutableStateOf<DownloadControl?>(null) }
     var mangaCacheSize by remember { mutableStateOf(0L) }
+    val favoritesPreferences = remember {
+        context.getSharedPreferences(FAVORITES_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    var favorites by remember { mutableStateOf(loadFavorites(favoritesPreferences)) }
+    var cachedMangaEntries by remember { mutableStateOf<List<CachedMangaEntry>>(emptyList()) }
+    val privacyPreferences = remember {
+        context.getSharedPreferences(PRIVACY_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    var hideAudioArtwork by remember {
+        mutableStateOf(privacyPreferences.getBoolean(HIDE_AUDIO_ARTWORK_KEY, false))
+    }
+    var mangaFavOnly by remember { mutableStateOf(false) }
+    var mangaUnreadOnly by remember { mutableStateOf(false) }
+    var mangaCachedOnly by remember { mutableStateOf(false) }
 
     fun refreshRecentItems() {
         recentItems = loadRecentItems(recentPreferences)
+    }
+
+    fun refreshFavorites() {
+        favorites = loadFavorites(favoritesPreferences)
+    }
+
+    fun toggleFavoriteItem(type: String, key: String, name: String) {
+        favorites = toggleFavorite(favoritesPreferences, type, key, name)
     }
 
     fun refreshMangaCacheSize() {
         scope.launch {
             mangaCacheSize = withContext(Dispatchers.IO) {
                 mangaCacheSizeBytes(cacheDirectory)
+            }
+            cachedMangaEntries = withContext(Dispatchers.IO) {
+                listCachedManga(cacheDirectory, mangaCacheMetadata)
             }
         }
     }
@@ -474,6 +512,7 @@ private fun NasConnectionScreen(
     LaunchedEffect(isConnected, selectedSection) {
         if (isConnected && selectedSection == null) {
             refreshRecentItems()
+            refreshFavorites()
             refreshMangaCacheSize()
         }
     }
@@ -713,6 +752,28 @@ private fun NasConnectionScreen(
             readingProgress = readingProgress,
             videoProgress = videoProgressPreferences,
             mangaCacheSize = mangaCacheSize,
+            favorites = favorites,
+            onOpenFavorite = { favorite ->
+                openRecentItem(
+                    RecentItem(favorite.type, favorite.key, favorite.name, favorite.timestamp)
+                )
+            },
+            cachedMangaEntries = cachedMangaEntries,
+            onDeleteCachedManga = { zipName ->
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        deleteCachedManga(cacheDirectory, mangaCacheMetadata, zipName)
+                    }
+                    refreshMangaCacheSize()
+                }
+            },
+            hideAudioArtwork = hideAudioArtwork,
+            onToggleHideAudioArtwork = { enabled ->
+                hideAudioArtwork = enabled
+                privacyPreferences.edit()
+                    .putBoolean(HIDE_AUDIO_ARTWORK_KEY, enabled)
+                    .apply()
+            },
             onOpenRecent = { item -> openRecentItem(item) },
             onClearMangaCache = {
                 scope.launch {
@@ -1039,18 +1100,40 @@ private fun NasConnectionScreen(
                 availableCategories = MANGA_FILTER_CATEGORIES,
                 onFiltersChange = { mangaFilters = it }
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = mangaFavOnly,
+                    onClick = { mangaFavOnly = !mangaFavOnly },
+                    label = { Text("お気に入りのみ") }
+                )
+                FilterChip(
+                    selected = mangaUnreadOnly,
+                    onClick = { mangaUnreadOnly = !mangaUnreadOnly },
+                    label = { Text("未読のみ") }
+                )
+                FilterChip(
+                    selected = mangaCachedOnly,
+                    onClick = { mangaCachedOnly = !mangaCachedOnly },
+                    label = { Text("キャッシュ済みのみ") }
+                )
+            }
         }
 
         LazyColumn(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+                val cachedMangaNames = cachedMangaEntries.map { it.zipName }.toSet()
                 val filteredMangaFiles = mangaFiles.filter { fileName ->
                     matchesDlsiteLibraryFilter(
                         displayName = fileName,
                         workInfo = mangaMetadata[fileName],
                         filters = mangaFilters
-                    )
+                    ) && (!mangaFavOnly ||
+                        isFavorite(favorites, RECENT_TYPE_MANGA, fileName)) &&
+                        (!mangaUnreadOnly ||
+                            savedPage(readingProgress, fileName) <= 0) &&
+                        (!mangaCachedOnly || fileName in cachedMangaNames)
                 }
                 val sortedMangaFiles = when (mangaSort) {
                     LibrarySort.NAME_ASC ->
@@ -1084,11 +1167,23 @@ private fun NasConnectionScreen(
                             .fillMaxWidth()
                             .clickable(enabled = !isLoading) { openManga(fileName) }
                     ) {
-                        MangaLibraryCardContent(
-                            fileName = fileName,
-                            cacheDirectory = cacheDirectory,
-                            progressLabel = savedProgressLabel(readingProgress, fileName)
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.weight(1f)) {
+                                MangaLibraryCardContent(
+                                    fileName = fileName,
+                                    cacheDirectory = cacheDirectory,
+                                    progressLabel = savedProgressLabel(readingProgress, fileName)
+                                )
+                            }
+                            val isFav = isFavorite(favorites, RECENT_TYPE_MANGA, fileName)
+                            TextButton(
+                                onClick = {
+                                    toggleFavoriteItem(RECENT_TYPE_MANGA, fileName, fileName)
+                                }
+                            ) {
+                                Text(if (isFav) "★" else "☆")
+                            }
+                        }
                     }
                 }
             }
@@ -1099,191 +1194,13 @@ private fun NasConnectionScreen(
     }
 }
 
-@Composable
-private fun LibrarySortControl(
-    sort: LibrarySort,
-    onSortChange: (LibrarySort) -> Unit
-) {
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        LibrarySort.entries.forEach { option ->
-            FilterChip(
-                selected = sort == option,
-                onClick = { onSortChange(option) },
-                label = { Text(option.label) }
-            )
-        }
-    }
-}
 
-private fun <T> sortByName(
-    entries: List<T>,
-    sort: LibrarySort,
-    isDirectory: (T) -> Boolean,
-    name: (T) -> String
-): List<T> = entries.sortedWith { left, right ->
-    val leftDir = isDirectory(left)
-    val rightDir = isDirectory(right)
-    when {
-        leftDir && !rightDir -> -1
-        !leftDir && rightDir -> 1
-        sort == LibrarySort.NAME_ASC -> compareNaturally(name(left), name(right))
-        else -> compareNaturally(name(right), name(left))
-    }
-}
 
-@Composable
-private fun EmptyLibraryState(message: String, onRefresh: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        Text(message)
-        Button(onClick = onRefresh) { Text("再読み込み") }
-    }
-}
 
-@Composable
-private fun MediaSearchField(
-    query: String,
-    onQueryChange: (String) -> Unit,
-    label: String
-) {
-    val focusManager = LocalFocusManager.current
-    OutlinedTextField(
-        value = query,
-        onValueChange = onQueryChange,
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text(label) },
-        trailingIcon = if (query.isNotEmpty()) {
-            {
-                TextButton(onClick = { onQueryChange("") }) { Text("消去") }
-        }
-        } else {
-            null
-        },
-        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-        keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus() }),
-        singleLine = true
-    )
-}
 
-@Composable
-private fun EmptySearchResult(onClear: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        Text("一致する項目がありません")
-        TextButton(onClick = onClear) { Text("検索をクリア") }
-    }
-}
 
-@Composable
-private fun LocationLabel(root: String, currentPath: String) {
-    val location = if (currentPath.isEmpty()) {
-        root
-    } else {
-        "$root › ${currentPath.replace("\\", " › ")}"
-    }
-    Text(
-        text = location,
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
-}
 
-private fun matchesSearch(
-    query: String,
-    name: String,
-    workInfo: DlsiteWorkInfo? = null
-): Boolean {
-    val terms = query.trim().split(Regex("\\s+")).filter(String::isNotEmpty)
-    if (terms.isEmpty()) return true
-    val searchableText = buildString {
-        append(name)
-        workInfo?.let {
-            append(' ')
-            append(it.productId)
-            append(' ')
-            append(it.title)
-            append(' ')
-            append(it.circleName)
-            append(' ')
-            append(it.voiceActors.joinToString(" "))
-            append(' ')
-            append(it.genres.joinToString(" "))
-        }
-    }
-    return terms.all { searchableText.contains(it, ignoreCase = true) }
-}
 
-@Composable
-private fun MangaLibraryCardContent(
-    fileName: String,
-    cacheDirectory: LocalFile,
-    progressLabel: String?
-) {
-    val context = LocalContext.current
-    val productId = remember(fileName) { findDlsiteProductId(fileName) }
-    var workInfo by remember(fileName) { mutableStateOf<DlsiteWorkInfo?>(null) }
-    var thumbnail by remember(fileName) { mutableStateOf<Bitmap?>(null) }
-    var isLoading by remember(fileName) { mutableStateOf(true) }
-
-    LaunchedEffect(fileName) {
-        if (productId != null) {
-            workInfo = loadDlsiteWorkInfo(context, fileName)
-            thumbnail = workInfo?.let { loadDlsiteCoverBitmap(context, it) }
-        }
-        if (thumbnail == null) {
-            thumbnail = withContext(Dispatchers.IO) {
-                loadCachedMangaThumbnail(cacheDirectory, fileName)
-            }
-        }
-        isLoading = false
-    }
-
-    Row(
-        Modifier.fillMaxWidth().padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        Box(
-            Modifier.width(92.dp).height(128.dp)
-                .background(MaterialTheme.colorScheme.surfaceVariant),
-            contentAlignment = Alignment.Center
-        ) {
-            if (thumbnail != null) {
-                Image(
-                    bitmap = thumbnail!!.asImageBitmap(),
-                    contentDescription = "マンガ表紙",
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
-                )
-            } else if (isLoading) {
-                CircularProgressIndicator(Modifier.size(28.dp))
-            } else {
-                Text("表紙なし", style = MaterialTheme.typography.bodySmall)
-            }
-        }
-        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text(
-                workInfo?.title ?: fileName.substringBeforeLast('.'),
-                style = MaterialTheme.typography.titleMedium
-            )
-            workInfo?.circleName?.takeIf(String::isNotBlank)?.let {
-                Text(it, style = MaterialTheme.typography.bodyMedium)
-            }
-            productId?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall)
-            }
-            progressLabel?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall)
-            }
-        }
-    }
-}
 
 @Composable
 private fun MediaHomeScreen(
@@ -1294,6 +1211,12 @@ private fun MediaHomeScreen(
     readingProgress: SharedPreferences,
     videoProgress: SharedPreferences,
     mangaCacheSize: Long,
+    favorites: List<FavoriteItem>,
+    onOpenFavorite: (FavoriteItem) -> Unit,
+    cachedMangaEntries: List<CachedMangaEntry>,
+    onDeleteCachedManga: (String) -> Unit,
+    hideAudioArtwork: Boolean,
+    onToggleHideAudioArtwork: (Boolean) -> Unit,
     onOpenRecent: (RecentItem) -> Unit,
     onClearMangaCache: () -> Unit,
     onSelect: (MediaSection) -> Unit,
@@ -1463,6 +1386,42 @@ private fun MediaHomeScreen(
                     }
                 }
             }
+            if (favorites.isNotEmpty()) {
+                item {
+                    Text("お気に入り", style = MaterialTheme.typography.titleMedium)
+                }
+                item {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(favorites) { item ->
+                            Card(
+                                modifier = Modifier
+                                    .width(170.dp)
+                                    .clickable { onOpenFavorite(item) }
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        when (item.type) {
+                                            RECENT_TYPE_MANGA -> "マンガ"
+                                            RECENT_TYPE_VIDEO -> "ビデオ"
+                                            else -> "音声"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        item.name.substringBeforeLast('.'),
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                    Text("★ お気に入り", style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             item {
                 HorizontalDivider()
                 Text("ストレージ", style = MaterialTheme.typography.titleMedium)
@@ -1470,11 +1429,55 @@ private fun MediaHomeScreen(
                     "マンガキャッシュ：${formatFileSize(mangaCacheSize)}",
                     style = MaterialTheme.typography.bodyMedium
                 )
+                cachedMangaEntries.forEach { entry ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                entry.zipName.substringBeforeLast('.'),
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                formatFileSize(entry.sizeBytes),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        TextButton(onClick = { onDeleteCachedManga(entry.zipName) }) {
+                            Text("削除")
+                        }
+                    }
+                }
                 TextButton(
                     onClick = onClearMangaCache,
                     enabled = mangaCacheSize > 0L
                 ) {
-                    Text("キャッシュを削除")
+                    Text("キャッシュをすべて削除")
+                }
+            }
+            item {
+                HorizontalDivider()
+                Text("設定", style = MaterialTheme.typography.titleMedium)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onToggleHideAudioArtwork(!hideAudioArtwork) },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = hideAudioArtwork,
+                        onCheckedChange = { onToggleHideAudioArtwork(it) }
+                    )
+                    Column {
+                        Text("音声のジャケットを隠す")
+                        Text(
+                            "通知・ロック画面に作品画像を表示しません（次に読み込むプレイリストから反映）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
             item {
@@ -1538,6 +1541,11 @@ private fun AudioBrowserScreen(
     val context = LocalContext.current
     var filters by remember(currentPath) { mutableStateOf(DlsiteLibraryFilters()) }
     var sort by remember(currentPath) { mutableStateOf(LibrarySort.NAME_ASC) }
+    val favoritesPreferences = remember {
+        context.getSharedPreferences(FAVORITES_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    var favorites by remember { mutableStateOf(loadFavorites(favoritesPreferences)) }
+    var favOnly by remember(currentPath) { mutableStateOf(false) }
     var metadataByPath by remember(currentPath) {
         mutableStateOf<Map<String, DlsiteWorkInfo>>(emptyMap())
     }
@@ -1579,6 +1587,11 @@ private fun AudioBrowserScreen(
                 onFiltersChange = { filters = it }
             )
             LibrarySortControl(sort) { sort = it }
+            FilterChip(
+                selected = favOnly,
+                onClick = { favOnly = !favOnly },
+                label = { Text("お気に入りのみ") }
+            )
             LazyColumn(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -1589,7 +1602,8 @@ private fun AudioBrowserScreen(
                             displayName = entry.name,
                             workInfo = metadataByPath[entry.path],
                             filters = filters
-                        )
+                        ) && (!favOnly || !entry.isDirectory ||
+                            isFavorite(favorites, RECENT_TYPE_AUDIO, entry.path))
                     },
                     sort,
                     { it.isDirectory },
@@ -1607,13 +1621,32 @@ private fun AudioBrowserScreen(
                     Card(Modifier.fillMaxWidth().clickable(enabled = !isLoading) {
                         if (entry.isDirectory) onOpenFolder(entry) else onOpenAudio(entry)
                     }) {
-                        if (entry.isDirectory && findDlsiteProductId(entry.name) != null) {
-                            DlsiteAudioFolderContent(entry)
-                        } else {
-                            Column(Modifier.padding(16.dp)) {
-                                Text(entry.name, style = MaterialTheme.typography.titleMedium)
-                                Text(if (entry.isDirectory) "作品フォルダ" else "音声トラック",
-                                    style = MaterialTheme.typography.bodySmall)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.weight(1f)) {
+                                if (entry.isDirectory && findDlsiteProductId(entry.name) != null) {
+                                    DlsiteAudioFolderContent(entry)
+                                } else {
+                                    Column(Modifier.padding(16.dp)) {
+                                        Text(entry.name, style = MaterialTheme.typography.titleMedium)
+                                        Text(if (entry.isDirectory) "作品フォルダ" else "音声トラック",
+                                            style = MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            }
+                            if (entry.isDirectory) {
+                                val isFav = isFavorite(favorites, RECENT_TYPE_AUDIO, entry.path)
+                                TextButton(
+                                    onClick = {
+                                        favorites = toggleFavorite(
+                                            favoritesPreferences,
+                                            RECENT_TYPE_AUDIO,
+                                            entry.path,
+                                            entry.name
+                                        )
+                                    }
+                                ) {
+                                    Text(if (isFav) "★" else "☆")
+                                }
                             }
                         }
                     }
@@ -2106,6 +2139,18 @@ private fun VideoBrowserScreen(
     val videoProgress = remember {
         context.getSharedPreferences(VIDEO_PROGRESS_PREFERENCES, Context.MODE_PRIVATE)
     }
+    val favoritesPreferences = remember {
+        context.getSharedPreferences(FAVORITES_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    var favorites by remember { mutableStateOf(loadFavorites(favoritesPreferences)) }
+    var favOnly by rememberSaveable(currentPath) { mutableStateOf(false) }
+    var unwatchedOnly by rememberSaveable(currentPath) { mutableStateOf(false) }
+    val searchHistoryPreferences = remember {
+        context.getSharedPreferences(SEARCH_HISTORY_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    var searchHistory by remember {
+        mutableStateOf(loadSearchHistory(searchHistoryPreferences, "VIDEO"))
+    }
     BackHandler(onBack = onBack)
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -2135,14 +2180,46 @@ private fun VideoBrowserScreen(
             LocationLabel("video", currentPath)
             if (isLoading) CircularProgressIndicator(Modifier.size(24.dp))
             if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
-            MediaSearchField(query, { query = it }, "ビデオ・フォルダを検索")
+            MediaSearchField(
+                query,
+                { query = it },
+                "ビデオ・フォルダを検索",
+                history = searchHistory,
+                onSearchSubmit = {
+                    searchHistory = recordSearchHistory(
+                        searchHistoryPreferences, "VIDEO", query
+                    )
+                },
+                onClearHistory = {
+                    clearSearchHistory(searchHistoryPreferences, "VIDEO")
+                    searchHistory = emptyList()
+                }
+            )
             LibrarySortControl(sort) { sort = it }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = favOnly,
+                    onClick = { favOnly = !favOnly },
+                    label = { Text("お気に入りのみ") }
+                )
+                FilterChip(
+                    selected = unwatchedOnly,
+                    onClick = { unwatchedOnly = !unwatchedOnly },
+                    label = { Text("未視聴のみ") }
+                )
+            }
             LazyColumn(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 val filteredEntries = sortByName(
-                    entries.filter { matchesSearch(query, it.name) },
+                    entries.filter { entry ->
+                        matchesSearch(query, entry.name) &&
+                            (!favOnly || entry.isDirectory ||
+                                isFavorite(favorites, RECENT_TYPE_VIDEO, entry.path)) &&
+                            (!unwatchedOnly || entry.isDirectory ||
+                                videoProgress.getLong(videoProgressKey(entry.path), 0L) <= 0L)
+                    },
                     sort,
                     { it.isDirectory },
                     { it.name }
@@ -2167,22 +2244,39 @@ private fun VideoBrowserScreen(
                                 else onOpenVideo(entry)
                             }
                     ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Text(entry.name, style = MaterialTheme.typography.titleMedium)
-                            Text(
-                                if (entry.isDirectory) "フォルダ" else "動画",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            if (!entry.isDirectory) {
-                                val savedPosition = videoProgress.getLong(
-                                    videoProgressKey(entry.path),
-                                    0L
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.padding(16.dp).weight(1f)) {
+                                Text(entry.name, style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    if (entry.isDirectory) "フォルダ" else "動画",
+                                    style = MaterialTheme.typography.bodySmall
                                 )
-                                if (savedPosition > 0L) {
-                                    Text(
-                                        "続きから ${formatPlaybackTime(savedPosition)}",
-                                        style = MaterialTheme.typography.bodySmall
+                                if (!entry.isDirectory) {
+                                    val savedPosition = videoProgress.getLong(
+                                        videoProgressKey(entry.path),
+                                        0L
                                     )
+                                    if (savedPosition > 0L) {
+                                        Text(
+                                            "続きから ${formatPlaybackTime(savedPosition)}",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                }
+                            }
+                            if (!entry.isDirectory) {
+                                val isFav = isFavorite(favorites, RECENT_TYPE_VIDEO, entry.path)
+                                TextButton(
+                                    onClick = {
+                                        favorites = toggleFavorite(
+                                            favoritesPreferences,
+                                            RECENT_TYPE_VIDEO,
+                                            entry.path,
+                                            entry.name
+                                        )
+                                    }
+                                ) {
+                                    Text(if (isFav) "★" else "☆")
                                 }
                             }
                         }
@@ -2300,6 +2394,13 @@ private fun PhotoBrowserScreen(
     val thumbnailSemaphore = remember { Semaphore(3) }
     var query by rememberSaveable(currentPath) { mutableStateOf("") }
     var sort by rememberSaveable(currentPath) { mutableStateOf(LibrarySort.NAME_ASC) }
+    val context = LocalContext.current
+    val searchHistoryPreferences = remember {
+        context.getSharedPreferences(SEARCH_HISTORY_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    var searchHistory by remember {
+        mutableStateOf(loadSearchHistory(searchHistoryPreferences, "PHOTOS"))
+    }
     BackHandler(onBack = onBack)
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -2329,7 +2430,21 @@ private fun PhotoBrowserScreen(
             LocationLabel("Picture", currentPath)
             if (isLoading) CircularProgressIndicator(Modifier.size(24.dp))
             if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
-            MediaSearchField(query, { query = it }, "写真・フォルダを検索")
+            MediaSearchField(
+                query,
+                { query = it },
+                "写真・フォルダを検索",
+                history = searchHistory,
+                onSearchSubmit = {
+                    searchHistory = recordSearchHistory(
+                        searchHistoryPreferences, "PHOTOS", query
+                    )
+                },
+                onClearHistory = {
+                    clearSearchHistory(searchHistoryPreferences, "PHOTOS")
+                    searchHistory = emptyList()
+                }
+            )
             LibrarySortControl(sort) { sort = it }
 
             LazyVerticalGrid(
