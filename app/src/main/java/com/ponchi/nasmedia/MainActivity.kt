@@ -389,6 +389,72 @@ private fun NasConnectionScreen(
         }
     }
 
+    fun openPhotoDirectory(path: String) {
+        photoPath = path
+        photoEntries = emptyList()
+        photoStatus = ""
+        photoIsLoading = true
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    loadPhotoEntries(server.trim(), username.trim(), password, path)
+                }
+            }.onSuccess { entries ->
+                photoEntries = entries
+                photoStatus = if (entries.isEmpty()) "空のフォルダです" else ""
+            }.onFailure {
+                photoStatus = "写真を読み込めません"
+            }
+            photoIsLoading = false
+        }
+    }
+
+    fun openVideoDirectory(path: String) {
+        videoPath = path
+        videoEntries = emptyList()
+        videoStatus = ""
+        videoIsLoading = true
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    loadVideoEntries(server.trim(), username.trim(), password, path)
+                }
+            }.onSuccess { entries ->
+                videoEntries = entries
+                videoStatus = if (entries.isEmpty()) "空のフォルダです" else ""
+            }.onFailure {
+                videoStatus = "ビデオを読み込めません"
+            }
+            videoIsLoading = false
+        }
+    }
+
+    fun openAudioDirectory(path: String, autoAdvance: Boolean = true) {
+        audioPath = path
+        audioEntries = emptyList()
+        audioStatus = ""
+        audioIsLoading = true
+        scope.launch {
+            runCatching { withContext(Dispatchers.IO) {
+                if (autoAdvance) {
+                    resolveAudioDirectory(server.trim(), username.trim(), password, path)
+                } else {
+                    ResolvedAudioDirectory(
+                        path = path,
+                        entries = loadAudioEntries(
+                            server.trim(), username.trim(), password, path
+                        )
+                    )
+                }
+            } }.onSuccess { directory ->
+                audioPath = directory.path
+                audioEntries = directory.entries
+                audioStatus = if (directory.entries.isEmpty()) "空のフォルダです" else ""
+            }.onFailure { audioStatus = "音声を読み込めません" }
+            audioIsLoading = false
+        }
+    }
+
     fun openRecentItem(item: RecentItem) {
         when (item.type) {
             RECENT_TYPE_MANGA -> {
@@ -581,71 +647,6 @@ private fun NasConnectionScreen(
         }
     }
 
-    fun openPhotoDirectory(path: String) {
-        photoPath = path
-        photoEntries = emptyList()
-        photoStatus = ""
-        photoIsLoading = true
-        scope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    loadPhotoEntries(server.trim(), username.trim(), password, path)
-                }
-            }.onSuccess { entries ->
-                photoEntries = entries
-                photoStatus = if (entries.isEmpty()) "空のフォルダです" else ""
-            }.onFailure {
-                photoStatus = "写真を読み込めません"
-            }
-            photoIsLoading = false
-        }
-    }
-
-    fun openVideoDirectory(path: String) {
-        videoPath = path
-        videoEntries = emptyList()
-        videoStatus = ""
-        videoIsLoading = true
-        scope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    loadVideoEntries(server.trim(), username.trim(), password, path)
-                }
-            }.onSuccess { entries ->
-                videoEntries = entries
-                videoStatus = if (entries.isEmpty()) "空のフォルダです" else ""
-            }.onFailure {
-                videoStatus = "ビデオを読み込めません"
-            }
-            videoIsLoading = false
-        }
-    }
-
-    fun openAudioDirectory(path: String, autoAdvance: Boolean = true) {
-        audioPath = path
-        audioEntries = emptyList()
-        audioStatus = ""
-        audioIsLoading = true
-        scope.launch {
-            runCatching { withContext(Dispatchers.IO) {
-                if (autoAdvance) {
-                    resolveAudioDirectory(server.trim(), username.trim(), password, path)
-                } else {
-                    ResolvedAudioDirectory(
-                        path = path,
-                        entries = loadAudioEntries(
-                            server.trim(), username.trim(), password, path
-                        )
-                    )
-                }
-            } }.onSuccess { directory ->
-                audioPath = directory.path
-                audioEntries = directory.entries
-                audioStatus = if (directory.entries.isEmpty()) "空のフォルダです" else ""
-            }.onFailure { audioStatus = "音声を読み込めません" }
-            audioIsLoading = false
-        }
-    }
 
     openedAudioPlaylist?.let { playlist ->
         AudioPlayerScreen(
