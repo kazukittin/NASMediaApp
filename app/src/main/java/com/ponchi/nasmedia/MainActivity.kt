@@ -42,6 +42,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -57,7 +58,10 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -116,7 +120,9 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -223,6 +229,22 @@ private enum class MediaSection(
     AUDIO("音声", "作品ごとに再生")
 }
 
+private data class RecentItem(
+    val type: String,
+    val key: String,
+    val name: String,
+    val timestamp: Long
+)
+
+private enum class LibrarySort(val label: String) {
+    NAME_ASC("名前順（昇順）"),
+    NAME_DESC("名前順（降順）")
+}
+
+private class DownloadControl {
+    @Volatile var cancelled: Boolean = false
+}
+
 @Composable
 private fun NasConnectionScreen(
     cacheDirectory: LocalFile,
@@ -254,6 +276,7 @@ private fun NasConnectionScreen(
     var audioIsLoading by remember { mutableStateOf(false) }
     var openedAudioPlaylist by remember { mutableStateOf<AudioPlaylist?>(null) }
     var status by remember { mutableStateOf("") }
+    var connectionFailed by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var rememberLogin by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -275,6 +298,7 @@ private fun NasConnectionScreen(
             return
         }
         isLoading = true
+        connectionFailed = false
         mangaFiles = emptyList()
         status = "接続中…"
         scope.launch {
@@ -300,8 +324,9 @@ private fun NasConnectionScreen(
                 isConnected = true
                 selectedSection = null
                 status = if (files.isEmpty()) "MangaにZIPがありません" else ""
-            }.onFailure {
-                status = "接続できません"
+            }.onFailure { error ->
+                connectionFailed = true
+                status = classifyNasConnectionError(error)
             }
             isLoading = false
         }
@@ -663,6 +688,17 @@ private fun NasConnectionScreen(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("NASに接続")
+            }
+            if (connectionFailed && !isLoading) {
+                Button(
+                    onClick = {
+                        focusManager.clearFocus()
+                        connectToNas()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("再試行")
+                }
             }
             if (hasSavedCredentials) {
                 TextButton(
@@ -2414,11 +2450,32 @@ private fun loadPhotoBitmap(
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(cachedPhoto.absolutePath, bounds)
     require(bounds.outWidth > 0 && bounds.outHeight > 0) { "写真を読み取れません" }
+
+    // サムネイル表示では縮小済み画像をディスクに残し、次回は元画像を開かずに済ませる
+    val thumbFile = if (maxSide <= 500) {
+        val thumbDir = LocalFile(cacheDirectory, "photo-thumb-cache").apply { mkdirs() }
+        LocalFile(thumbDir, "thumb-${photoPath.hashCode()}-$maxSide.jpg")
+    } else {
+        null
+    }
+    if (thumbFile != null && thumbFile.isFile && thumbFile.length() > 0L) {
+        BitmapFactory.decodeFile(thumbFile.absolutePath)
+            ?.let { return@withDiskShare it }
+    }
+
     val options = BitmapFactory.Options().apply {
         inSampleSize = calculateSampleSize(bounds.outWidth, bounds.outHeight, maxSide)
     }
-    BitmapFactory.decodeFile(cachedPhoto.absolutePath, options)
+    val decoded = BitmapFactory.decodeFile(cachedPhoto.absolutePath, options)
         ?: error("写真を読み取れません")
+    if (thumbFile != null) {
+        runCatching {
+            thumbFile.outputStream().use { output ->
+                decoded.compress(Bitmap.CompressFormat.JPEG, 82, output)
+            }
+        }
+    }
+    decoded
 }
 
 private fun joinSmbPath(parent: String, child: String): String {
@@ -2446,7 +2503,9 @@ private fun downloadAndOpenManga(
     password: String,
     zipName: String,
     cacheDirectory: LocalFile,
-    cacheMetadata: SharedPreferences
+    cacheMetadata: SharedPreferences,
+    onProgress: ((Long, Long) -> Unit)? = null,
+    downloadControl: DownloadControl? = null
 ): MangaBook {
     val previewDirectory = LocalFile(cacheDirectory, "manga-preview").apply { mkdirs() }
     val cachedZip = LocalFile(previewDirectory, "${zipName.hashCode()}.zip")
@@ -2462,7 +2521,7 @@ private fun downloadAndOpenManga(
 
         var downloadedNow = false
         if (!cacheIsCurrent) {
-            downloadZip(share, zipName, cachedZip, remoteSize)
+            downloadZip(share, zipName, cachedZip, remoteSize, onProgress, downloadControl)
             saveCacheMetadata(cacheMetadata, zipName, remoteSize, remoteModified)
             downloadedNow = true
         }
@@ -2472,7 +2531,7 @@ private fun downloadAndOpenManga(
         }.recoverCatching {
             if (downloadedNow) throw it
             cachedZip.delete()
-            downloadZip(share, zipName, cachedZip, remoteSize)
+            downloadZip(share, zipName, cachedZip, remoteSize, onProgress, downloadControl)
             saveCacheMetadata(cacheMetadata, zipName, remoteSize, remoteModified)
             readMangaBook(cachedZip, zipName)
         }.getOrThrow()
@@ -2483,16 +2542,20 @@ private fun downloadZip(
     share: DiskShare,
     zipName: String,
     destination: LocalFile,
-    expectedSize: Long
+    expectedSize: Long,
+    onProgress: ((Long, Long) -> Unit)? = null,
+    downloadControl: DownloadControl? = null
 ) {
-    downloadRemoteFile(share, zipName, destination, expectedSize)
+    downloadRemoteFile(share, zipName, destination, expectedSize, onProgress, downloadControl)
 }
 
 private fun downloadRemoteFile(
     share: DiskShare,
     remotePath: String,
     destination: LocalFile,
-    expectedSize: Long
+    expectedSize: Long,
+    onProgress: ((Long, Long) -> Unit)? = null,
+    downloadControl: DownloadControl? = null
 ) {
     val partialFile = LocalFile(destination.parentFile, "${destination.name}.part")
     partialFile.delete()
@@ -2506,7 +2569,20 @@ private fun downloadRemoteFile(
             EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE)
         ).use { remoteFile ->
             remoteFile.inputStream.use { input ->
-                partialFile.outputStream().use { output -> input.copyTo(output) }
+                partialFile.outputStream().use { output ->
+                    val buffer = ByteArray(256 * 1024)
+                    var copied = 0L
+                    while (true) {
+                        if (downloadControl?.cancelled == true) {
+                            throw CancellationException("ダウンロードをキャンセルしました")
+                        }
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        copied += read.toLong()
+                        onProgress?.invoke(copied, expectedSize)
+                    }
+                }
             }
         }
         require(partialFile.length() == expectedSize) { "ファイルの取得が完了していません" }
@@ -2609,6 +2685,12 @@ private const val SWIPE_THRESHOLD_PX = 80f
 private const val READING_PROGRESS_PREFERENCES = "reading_progress"
 private const val MANGA_CACHE_PREFERENCES = "manga_cache_metadata"
 private const val VIDEO_PROGRESS_PREFERENCES = "video_progress"
+private const val RECENT_PREFERENCES = "recently_opened"
+private const val RECENT_ITEMS_KEY = "items"
+private const val MAX_RECENT_ITEMS = 20
+private const val RECENT_TYPE_MANGA = "MANGA"
+private const val RECENT_TYPE_VIDEO = "VIDEO"
+private const val RECENT_TYPE_AUDIO = "AUDIO"
 private const val TITLE_AND_GUIDE_VISIBLE_MILLIS = 3_000L
 private const val TITLE_AND_GUIDE_FADE_MILLIS = 700
 private const val VIDEO_PROGRESS_SAVE_INTERVAL_MILLIS = 5_000L
@@ -2689,6 +2771,98 @@ private fun calculateSampleSize(width: Int, height: Int, maxSide: Int): Int {
         sampleSize *= 2
     }
     return sampleSize
+}
+
+private fun classifyNasConnectionError(error: Throwable): String {
+    val details = generateSequence(error) { it.cause }
+        .flatMap { throwable ->
+            sequenceOf(throwable.javaClass.name, throwable.message.orEmpty())
+        }
+        .joinToString(" ")
+        .lowercase()
+    return when {
+        details.contains("logon_failure") || details.contains("logon failure") ||
+            details.contains("access_denied") || details.contains("access denied") ||
+            details.contains("authentication") || details.contains("ntlm") ||
+            details.contains("パスワード") ->
+            "認証に失敗しました。ユーザー名とパスワードを確認してください"
+        details.contains("bad_network_name") || details.contains("bad network name") ||
+            details.contains("object_name_not_found") || details.contains("object name not found") ||
+            details.contains("object_path_not_found") || details.contains("no such file") ||
+            details.contains("share") && details.contains("not found") ->
+            "共有フォルダが見つかりません。NASの共有フォルダ（Manga）を確認してください"
+        details.contains("unknownhost") || details.contains("timed out") ||
+            details.contains("timeout") || details.contains("connectexception") ||
+            details.contains("noroutetohost") || details.contains("unreachable") ||
+            details.contains("ehostunreach") || details.contains("etimedout") ||
+            details.contains("connection refused") || details.contains("failed to connect") ->
+            "NASに接続できません。NASの電源とIPアドレス、同じネットワークに接続しているか確認してください"
+        else -> "接続できません。NASとネットワークの状態を確認してください"
+    }
+}
+
+private fun recordRecentItem(
+    preferences: SharedPreferences,
+    type: String,
+    key: String,
+    name: String
+) {
+    val sanitizedKey = key.replace('\t', ' ').replace('\n', ' ')
+    val sanitizedName = name.replace('\t', ' ').replace('\n', ' ')
+    val current = loadRecentItems(preferences)
+        .filterNot { it.type == type && it.key == sanitizedKey }
+    val updated = (listOf(
+        RecentItem(type, sanitizedKey, sanitizedName, System.currentTimeMillis())
+    ) + current).take(MAX_RECENT_ITEMS)
+    preferences.edit()
+        .putString(
+            RECENT_ITEMS_KEY,
+            updated.joinToString("\n") { item ->
+                listOf(item.type, item.timestamp.toString(), item.key, item.name)
+                    .joinToString("\t")
+            }
+        )
+        .apply()
+}
+
+private fun loadRecentItems(preferences: SharedPreferences): List<RecentItem> {
+    val raw = preferences.getString(RECENT_ITEMS_KEY, null) ?: return emptyList()
+    return raw.split("\n").mapNotNull { line ->
+        val parts = line.split("\t")
+        if (parts.size < 4) return@mapNotNull null
+        RecentItem(
+            type = parts[0],
+            key = parts[2],
+            name = parts[3],
+            timestamp = parts[1].toLongOrNull() ?: 0L
+        )
+    }
+}
+
+private fun formatFileSize(bytes: Long): String {
+    if (bytes < 1024L) return "$bytes B"
+    val units = listOf("KB", "MB", "GB")
+    var value = bytes.toDouble() / 1024.0
+    var unitIndex = 0
+    while (value >= 1024.0 && unitIndex < units.lastIndex) {
+        value /= 1024.0
+        unitIndex++
+    }
+    return "%.1f %s".format(value, units[unitIndex])
+}
+
+private fun mangaCacheSizeBytes(cacheDirectory: LocalFile): Long {
+    val previewDirectory = LocalFile(cacheDirectory, "manga-preview")
+    if (!previewDirectory.isDirectory) return 0L
+    return previewDirectory.walkTopDown()
+        .filter { it.isFile }
+        .sumOf { it.length() }
+}
+
+private fun clearMangaCache(cacheDirectory: LocalFile, cacheMetadata: SharedPreferences) {
+    val previewDirectory = LocalFile(cacheDirectory, "manga-preview")
+    previewDirectory.listFiles()?.forEach { it.delete() }
+    cacheMetadata.edit().clear().apply()
 }
 
 private inline fun <T> withMangaShare(
