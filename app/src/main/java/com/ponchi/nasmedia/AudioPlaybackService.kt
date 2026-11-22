@@ -54,7 +54,12 @@ class AudioPlaybackService : MediaSessionService() {
     private fun loadRequest() {
         val request = AudioPlaybackRequestStore.request ?: return
         serviceScope.launch {
-            val artwork = runCatching {
+            // プライバシー設定がONのときは通知・ロック画面に実ジャケットを出さない
+            val hideArtwork = getSharedPreferences(PRIVACY_PREFERENCES, MODE_PRIVATE)
+                .getBoolean(HIDE_AUDIO_ARTWORK_KEY, false)
+            val artwork = if (hideArtwork) {
+                null
+            } else runCatching {
                 loadPreferredAudioCoverBitmap(
                     this@AudioPlaybackService,
                     request.server,

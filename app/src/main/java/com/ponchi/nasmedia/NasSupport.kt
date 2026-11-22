@@ -630,3 +630,276 @@ internal inline fun <T> withDiskShare(
     }
 }
 
+
+// ---- Phase 2: お気に入り ----
+internal const val FAVORITES_PREFERENCES = "favorites"
+internal const val FAVORITES_KEY = "items"
+
+internal data class FavoriteItem(
+    val type: String,
+    val key: String,
+    val name: String,
+    val timestamp: Long
+)
+
+private fun sanitizeKeyPart(value: String): String =
+    value.replace('\t', ' ').replace('\n', ' ')
+
+internal fun loadFavorites(preferences: SharedPreferences): List<FavoriteItem> {
+    val raw = preferences.getString(FAVORITES_KEY, null) ?: return emptyList()
+    return raw.split("\n").mapNotNull { line ->
+        val parts = line.split("\t")
+        if (parts.size < 4) return@mapNotNull null
+        FavoriteItem(
+            type = parts[0],
+            key = parts[2],
+            name = parts[3],
+            timestamp = parts[1].toLongOrNull() ?: 0L
+        )
+    }
+}
+
+internal fun isFavorite(favorites: List<FavoriteItem>, type: String, key: String): Boolean =
+    favorites.any { it.type == type && it.key == key }
+
+/** お気に入りを切り替え、切り替え後の全件を返す */
+internal fun toggleFavorite(
+    preferences: SharedPreferences,
+    type: String,
+    key: String,
+    name: String
+): List<FavoriteItem> {
+    val current = loadFavorites(preferences)
+    val updated = if (isFavorite(current, type, key)) {
+        current.filterNot { it.type == type && it.key == key }
+    } else {
+        listOf(
+            FavoriteItem(type, sanitizeKeyPart(key), sanitizeKeyPart(name), System.currentTimeMillis())
+        ) + current
+    }
+    preferences.edit()
+        .putString(
+            FAVORITES_KEY,
+            updated.joinToString("\n") { item ->
+                listOf(item.type, item.timestamp.toString(), item.key, item.name)
+                    .joinToString("\t")
+            }
+        )
+        .apply()
+    return updated
+}
+
+// ---- Phase 2: 音声の状態（速度・キュー・しおり） ----
+internal const val AUDIO_STATE_PREFERENCES = "audio_state"
+internal const val MAX_AUDIO_QUEUE_FOLDERS = 20
+
+internal data class AudioQueueState(
+    val trackIndex: Int,
+    val positionMs: Long,
+    val trackPath: String
+)
+
+internal data class AudioBookmark(
+    val trackIndex: Int,
+    val positionMs: Long,
+    val trackPath: String
+)
+
+internal fun audioSpeedKey(folderPath: String) = "speed:$folderPath"
+
+internal fun loadAudioSpeed(preferences: SharedPreferences, folderPath: String): Float =
+    preferences.getFloat(audioSpeedKey(folderPath), 1f)
+
+internal fun saveAudioSpeed(preferences: SharedPreferences, folderPath: String, speed: Float) {
+    preferences.edit().putFloat(audioSpeedKey(folderPath), speed).apply()
+}
+
+private fun audioQueueKey(folderPath: String) = "queue:$folderPath"
+private const val AUDIO_QUEUE_ORDER_KEY = "queue_order"
+
+internal fun saveAudioQueue(
+    preferences: SharedPreferences,
+    folderPath: String,
+    trackIndex: Int,
+    positionMs: Long,
+    trackPath: String
+) {
+    val order = preferences.getString(AUDIO_QUEUE_ORDER_KEY, "")
+        ?.split("\n")?.filter { it.isNotEmpty() } ?: emptyList()
+    val newOrder = (listOf(folderPath) + order.filterNot { it == folderPath })
+    val editor = preferences.edit()
+    editor.putString(
+        audioQueueKey(folderPath),
+        listOf(trackIndex.toString(), positionMs.toString(), sanitizeKeyPart(trackPath))
+            .joinToString("\t")
+    )
+    newOrder.drop(MAX_AUDIO_QUEUE_FOLDERS).forEach { stale ->
+        editor.remove(audioQueueKey(stale))
+    }
+    editor.putString(
+        AUDIO_QUEUE_ORDER_KEY,
+        newOrder.take(MAX_AUDIO_QUEUE_FOLDERS).joinToString("\n")
+    )
+    editor.apply()
+}
+
+internal fun loadAudioQueue(
+    preferences: SharedPreferences,
+    folderPath: String
+): AudioQueueState? {
+    val raw = preferences.getString(audioQueueKey(folderPath), null) ?: return null
+    val parts = raw.split("\t")
+    if (parts.size < 3) return null
+    return AudioQueueState(
+        trackIndex = parts[0].toIntOrNull() ?: return null,
+        positionMs = parts[1].toLongOrNull() ?: 0L,
+        trackPath = parts[2]
+    )
+}
+
+internal fun clearAudioQueue(preferences: SharedPreferences, folderPath: String) {
+    preferences.edit().remove(audioQueueKey(folderPath)).apply()
+}
+
+private fun audioBookmarksKey(folderPath: String) = "bookmarks:$folderPath"
+
+internal fun loadAudioBookmarks(
+    preferences: SharedPreferences,
+    folderPath: String
+): List<AudioBookmark> {
+    val raw = preferences.getString(audioBookmarksKey(folderPath), null) ?: return emptyList()
+    return raw.split("\n").mapNotNull { line ->
+        val parts = line.split("\t")
+        if (parts.size < 3) return@mapNotNull null
+        AudioBookmark(
+            trackIndex = parts[0].toIntOrNull() ?: return@mapNotNull null,
+            positionMs = parts[1].toLongOrNull() ?: 0L,
+            trackPath = parts[2]
+        )
+    }
+}
+
+private fun saveAudioBookmarks(
+    preferences: SharedPreferences,
+    folderPath: String,
+    bookmarks: List<AudioBookmark>
+) {
+    preferences.edit()
+        .putString(
+            audioBookmarksKey(folderPath),
+            bookmarks.joinToString("\n") { bookmark ->
+                listOf(
+                    bookmark.trackIndex.toString(),
+                    bookmark.positionMs.toString(),
+                    sanitizeKeyPart(bookmark.trackPath)
+                ).joinToString("\t")
+            }
+        )
+        .apply()
+}
+
+internal fun addAudioBookmark(
+    preferences: SharedPreferences,
+    folderPath: String,
+    bookmark: AudioBookmark
+): List<AudioBookmark> {
+    val updated = (loadAudioBookmarks(preferences, folderPath) + bookmark)
+        .distinctBy { it.trackIndex to it.positionMs }
+        .sortedWith(compareBy({ it.trackIndex }, { it.positionMs }))
+    saveAudioBookmarks(preferences, folderPath, updated)
+    return updated
+}
+
+internal fun removeAudioBookmark(
+    preferences: SharedPreferences,
+    folderPath: String,
+    bookmark: AudioBookmark
+): List<AudioBookmark> {
+    val updated = loadAudioBookmarks(preferences, folderPath)
+        .filterNot { it.trackIndex == bookmark.trackIndex && it.positionMs == bookmark.positionMs }
+    saveAudioBookmarks(preferences, folderPath, updated)
+    return updated
+}
+
+// ---- Phase 2: 検索履歴 ----
+internal const val SEARCH_HISTORY_PREFERENCES = "search_history"
+internal const val MAX_SEARCH_HISTORY = 8
+
+internal fun loadSearchHistory(preferences: SharedPreferences, section: String): List<String> {
+    val raw = preferences.getString("history:$section", null) ?: return emptyList()
+    return raw.split("\n").filter { it.isNotEmpty() }
+}
+
+internal fun recordSearchHistory(
+    preferences: SharedPreferences,
+    section: String,
+    query: String
+): List<String> {
+    val trimmed = query.trim()
+    if (trimmed.isEmpty()) return loadSearchHistory(preferences, section)
+    val updated = (listOf(trimmed) + loadSearchHistory(preferences, section)
+        .filterNot { it.equals(trimmed, ignoreCase = true) }).take(MAX_SEARCH_HISTORY)
+    preferences.edit().putString("history:$section", updated.joinToString("\n")).apply()
+    return updated
+}
+
+internal fun clearSearchHistory(preferences: SharedPreferences, section: String) {
+    preferences.edit().remove("history:$section").apply()
+}
+
+// ---- Phase 2: プライバシー設定 ----
+internal const val PRIVACY_PREFERENCES = "privacy_settings"
+internal const val HIDE_AUDIO_ARTWORK_KEY = "hide_audio_artwork"
+
+// ---- Phase 2: マンガキャッシュ管理 ----
+internal data class CachedMangaEntry(
+    val zipName: String,
+    val sizeBytes: Long
+)
+
+internal fun isMangaCached(
+    cacheDirectory: LocalFile,
+    cacheMetadata: SharedPreferences,
+    zipName: String
+): Boolean {
+    if (!cacheMetadata.contains(cacheSizeKey(zipName))) return false
+    val cachedZip = LocalFile(
+        LocalFile(cacheDirectory, "manga-preview"), "${zipName.hashCode()}.zip"
+    )
+    return cachedZip.isFile && cachedZip.length() > 0L
+}
+
+internal fun listCachedManga(
+    cacheDirectory: LocalFile,
+    cacheMetadata: SharedPreferences
+): List<CachedMangaEntry> {
+    return cacheMetadata.all.keys
+        .filter { it.startsWith("size:") }
+        .map { key -> key.removePrefix("size:") }
+        .filter { zipName -> isMangaCached(cacheDirectory, cacheMetadata, zipName) }
+        .map { zipName ->
+            CachedMangaEntry(zipName, cacheMetadata.getLong(cacheSizeKey(zipName), 0L))
+        }
+        .sortedWith { a, b -> compareNaturally(a.zipName, b.zipName) }
+}
+
+internal fun deleteCachedManga(
+    cacheDirectory: LocalFile,
+    cacheMetadata: SharedPreferences,
+    zipName: String
+) {
+    val cachedZip = LocalFile(
+        LocalFile(cacheDirectory, "manga-preview"), "${zipName.hashCode()}.zip"
+    )
+    cachedZip.delete()
+    cacheMetadata.edit()
+        .remove(cacheSizeKey(zipName))
+        .remove(cacheModifiedKey(zipName))
+        .apply()
+}
+
+// ---- Phase 2: マンガリーダーの音量キーページ送り ----
+internal object MangaVolumeKeyHandler {
+    /** true = 次のページ, false = 前のページ。リーダー表示中のみ非null */
+    @Volatile var handler: ((Boolean) -> Unit)? = null
+}
