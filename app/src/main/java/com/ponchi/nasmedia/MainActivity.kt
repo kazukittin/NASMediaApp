@@ -146,14 +146,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class MangaBook(
+internal data class MangaBook(
     val zipName: String,
     val cachedZip: LocalFile,
     val pageNames: List<String>,
     val charset: Charset
 )
 
-private data class PhotoEntry(
+internal data class PhotoEntry(
     val name: String,
     val path: String,
     val isDirectory: Boolean
@@ -165,14 +165,14 @@ private data class PhotoGallery(
     val initialIndex: Int
 )
 
-private data class VideoEntry(
+internal data class VideoEntry(
     val name: String,
     val path: String,
     val isDirectory: Boolean
 )
 
-private data class AudioEntry(val name: String, val path: String, val isDirectory: Boolean)
-private data class ResolvedAudioDirectory(
+internal data class AudioEntry(val name: String, val path: String, val isDirectory: Boolean)
+internal data class ResolvedAudioDirectory(
     val path: String,
     val entries: List<AudioEntry>
 )
@@ -229,7 +229,7 @@ private enum class MediaSection(
     AUDIO("音声", "作品ごとに再生")
 }
 
-private data class RecentItem(
+internal data class RecentItem(
     val type: String,
     val key: String,
     val name: String,
@@ -241,7 +241,7 @@ private enum class LibrarySort(val label: String) {
     NAME_DESC("名前順（降順）")
 }
 
-private class DownloadControl {
+internal class DownloadControl {
     @Volatile var cancelled: Boolean = false
 }
 
@@ -290,6 +290,126 @@ private fun NasConnectionScreen(
     }
     val mangaCacheMetadata = remember {
         context.getSharedPreferences(MANGA_CACHE_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    val recentPreferences = remember {
+        context.getSharedPreferences(RECENT_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    val videoProgressPreferences = remember {
+        context.getSharedPreferences(VIDEO_PROGRESS_PREFERENCES, Context.MODE_PRIVATE)
+    }
+    var recentItems by remember { mutableStateOf(loadRecentItems(recentPreferences)) }
+    var mangaSort by remember { mutableStateOf(LibrarySort.NAME_ASC) }
+    var mangaDownloading by remember { mutableStateOf(false) }
+    var mangaDownloadPercent by remember { mutableStateOf(-1) }
+    var mangaDownloadControl by remember { mutableStateOf<DownloadControl?>(null) }
+    var mangaCacheSize by remember { mutableStateOf(0L) }
+
+    fun refreshRecentItems() {
+        recentItems = loadRecentItems(recentPreferences)
+    }
+
+    fun refreshMangaCacheSize() {
+        scope.launch {
+            mangaCacheSize = withContext(Dispatchers.IO) {
+                mangaCacheSizeBytes(cacheDirectory)
+            }
+        }
+    }
+
+    fun openManga(fileName: String) {
+        if (isLoading) return
+        val control = DownloadControl()
+        mangaDownloadControl = control
+        mangaDownloading = true
+        mangaDownloadPercent = -1
+        isLoading = true
+        status = "読み込み中…"
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    downloadAndOpenManga(
+                        server = server.trim(),
+                        username = username.trim(),
+                        password = password,
+                        zipName = fileName,
+                        cacheDirectory = cacheDirectory,
+                        cacheMetadata = mangaCacheMetadata,
+                        onProgress = { downloaded, total ->
+                            if (total > 0L) {
+                                val percent = (downloaded * 100L / total).toInt()
+                                if (percent != mangaDownloadPercent) {
+                                    mangaDownloadPercent = percent
+                                }
+                            }
+                        },
+                        downloadControl = control
+                    )
+                }
+            }.onSuccess {
+                readingProgress.edit()
+                    .putInt(pageCountKey(it.zipName), it.pageNames.size)
+                    .apply()
+                recordRecentItem(
+                    recentPreferences, RECENT_TYPE_MANGA, it.zipName, it.zipName
+                )
+                refreshRecentItems()
+                openedBook = it
+                status = ""
+                refreshMangaCacheSize()
+            }.onFailure {
+                status = if (control.cancelled) {
+                    "ダウンロードをキャンセルしました"
+                } else {
+                    "ZIPを開けません"
+                }
+            }
+            mangaDownloading = false
+            mangaDownloadPercent = -1
+            isLoading = false
+        }
+    }
+
+    fun reloadMangaList() {
+        if (isLoading) return
+        isLoading = true
+        status = "接続中…"
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    loadMangaZipNames(server.trim(), username.trim(), password)
+                }
+            }
+            result.onSuccess { files ->
+                mangaFiles = files
+                status = if (files.isEmpty()) "MangaにZIPがありません" else ""
+            }.onFailure { error ->
+                status = classifyNasConnectionError(error)
+            }
+            isLoading = false
+        }
+    }
+
+    fun openRecentItem(item: RecentItem) {
+        when (item.type) {
+            RECENT_TYPE_MANGA -> {
+                selectedSection = MediaSection.MANGA
+                openManga(item.key)
+            }
+            RECENT_TYPE_VIDEO -> {
+                openedVideoPath = item.key
+            }
+            RECENT_TYPE_AUDIO -> {
+                selectedSection = MediaSection.AUDIO
+                openAudioDirectory(item.key)
+            }
+        }
+    }
+
+    LaunchedEffect(isConnected, selectedSection) {
+        if (isConnected && selectedSection == null) {
+            refreshRecentItems()
+            refreshMangaCacheSize()
+        }
     }
 
     fun connectToNas() {
@@ -472,9 +592,31 @@ private fun NasConnectionScreen(
     }
 
     if (isConnected && selectedSection == null) {
+        val continueItems = recentItems.filter { item ->
+            when (item.type) {
+                RECENT_TYPE_MANGA -> readingProgress.contains(pageKey(item.key))
+                RECENT_TYPE_VIDEO ->
+                    videoProgressPreferences.getLong(videoProgressKey(item.key), 0L) > 0L
+                else -> false
+            }
+        }
         MediaHomeScreen(
             server = server,
             hasSavedCredentials = hasSavedCredentials,
+            continueItems = continueItems,
+            recentItems = recentItems,
+            readingProgress = readingProgress,
+            videoProgress = videoProgressPreferences,
+            mangaCacheSize = mangaCacheSize,
+            onOpenRecent = { item -> openRecentItem(item) },
+            onClearMangaCache = {
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        clearMangaCache(cacheDirectory, mangaCacheMetadata)
+                    }
+                    refreshMangaCacheSize()
+                }
+            },
             onSelect = { section ->
                 selectedSection = section
                 if (section == MediaSection.PHOTOS) openPhotoDirectory("")
@@ -542,7 +684,13 @@ private fun NasConnectionScreen(
             status = videoStatus,
             isLoading = videoIsLoading,
             onOpenFolder = ::openVideoDirectory,
-            onOpenVideo = { openedVideoPath = it.path },
+            onOpenVideo = { entry ->
+                recordRecentItem(
+                    recentPreferences, RECENT_TYPE_VIDEO, entry.path, entry.name
+                )
+                refreshRecentItems()
+                openedVideoPath = entry.path
+            },
             onRefresh = { openVideoDirectory(videoPath) },
             onBack = {
                 if (videoPath.isEmpty()) {
@@ -577,6 +725,13 @@ private fun NasConnectionScreen(
                         )
                     }
                 }
+                recordRecentItem(
+                    recentPreferences,
+                    RECENT_TYPE_AUDIO,
+                    audioPath,
+                    audioPath.substringAfterLast('\\').ifBlank { "Voice" }
+                )
+                refreshRecentItems()
                 val tracks = audioEntries.filterNot { it.isDirectory }
                 openedAudioPlaylist = AudioPlaylist(
                     folderPath = audioPath,
@@ -738,8 +893,40 @@ private fun NasConnectionScreen(
         if (status.isNotBlank()) {
             Text(status, style = MaterialTheme.typography.bodySmall)
         }
+        if (isConnected && mangaDownloading) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    if (mangaDownloadPercent >= 0) {
+                        "ダウンロード中… $mangaDownloadPercent%"
+                    } else {
+                        "ダウンロード中…"
+                    },
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (mangaDownloadPercent >= 0) {
+                    LinearProgressIndicator(
+                        progress = { mangaDownloadPercent / 100f },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                TextButton(onClick = { mangaDownloadControl?.cancelled = true }) {
+                    Text("キャンセル")
+                }
+            }
+        }
 
         if (isConnected && selectedSection == MediaSection.MANGA) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LibrarySort.entries.forEach { sort ->
+                    FilterChip(
+                        selected = mangaSort == sort,
+                        onClick = { mangaSort = sort },
+                        label = { Text(sort.label) }
+                    )
+                }
+            }
             DlsiteLibraryFilterControls(
                 candidates = mangaFiles.map {
                     DlsiteFilterCandidate(it, mangaMetadata[it])
@@ -750,7 +937,10 @@ private fun NasConnectionScreen(
             )
         }
 
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
                 val filteredMangaFiles = mangaFiles.filter { fileName ->
                     matchesDlsiteLibraryFilter(
                         displayName = fileName,
@@ -758,37 +948,37 @@ private fun NasConnectionScreen(
                         filters = mangaFilters
                     )
                 }
-                items(filteredMangaFiles) { fileName ->
+                val sortedMangaFiles = when (mangaSort) {
+                    LibrarySort.NAME_ASC ->
+                        filteredMangaFiles.sortedWith { a, b -> compareNaturally(a, b) }
+                    LibrarySort.NAME_DESC ->
+                        filteredMangaFiles.sortedWith { a, b -> compareNaturally(b, a) }
+                }
+                if (sortedMangaFiles.isEmpty() && !isLoading) {
+                    item {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                if (mangaFiles.isEmpty()) {
+                                    "マンガがありません"
+                                } else {
+                                    "条件に合うマンガがありません"
+                                }
+                            )
+                            Button(onClick = { reloadMangaList() }) {
+                                Text("再読み込み")
+                            }
+                        }
+                    }
+                }
+                items(sortedMangaFiles) { fileName ->
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable(enabled = !isLoading) {
-                            isLoading = true
-                            status = "読み込み中…"
-                            scope.launch {
-                                runCatching {
-                                    withContext(Dispatchers.IO) {
-                                        downloadAndOpenManga(
-                                            server = server.trim(),
-                                            username = username.trim(),
-                                            password = password,
-                                            zipName = fileName,
-                                            cacheDirectory = cacheDirectory,
-                                            cacheMetadata = mangaCacheMetadata
-                                        )
-                                    }
-                                }.onSuccess {
-                                    readingProgress.edit()
-                                        .putInt(pageCountKey(it.zipName), it.pageNames.size)
-                                        .apply()
-                                    openedBook = it
-                                    status = ""
-                                }.onFailure {
-                                    status = "ZIPを開けません"
-                                }
-                                isLoading = false
-                            }
-                            }
+                            .clickable(enabled = !isLoading) { openManga(fileName) }
                     ) {
                         MangaLibraryCardContent(
                             fileName = fileName,
@@ -948,61 +1138,204 @@ private fun MangaLibraryCardContent(
 private fun MediaHomeScreen(
     server: String,
     hasSavedCredentials: Boolean,
+    continueItems: List<RecentItem>,
+    recentItems: List<RecentItem>,
+    readingProgress: SharedPreferences,
+    videoProgress: SharedPreferences,
+    mangaCacheSize: Long,
+    onOpenRecent: (RecentItem) -> Unit,
+    onClearMangaCache: () -> Unit,
     onSelect: (MediaSection) -> Unit,
     onForgetCredentials: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    bottomBar: @Composable () -> Unit = {}
 ) {
     Surface(
         modifier = modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background,
         contentColor = MaterialTheme.colorScheme.onBackground
     ) {
-        Column(
+        Column(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
             modifier = Modifier
-                .fillMaxSize()
+                .weight(1f)
                 .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("NAS Media", style = MaterialTheme.typography.titleLarge)
-            Text(
-                server,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                gridItems(MediaSection.entries) { section ->
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(120.dp)
-                            .clickable { onSelect(section) }
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(16.dp),
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            Text(section.title, style = MaterialTheme.typography.titleLarge)
-                            Text(
-                                section.description,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
+            item {
+                Text("NAS Media", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    server,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (continueItems.isNotEmpty()) {
+                item {
+                    Text("続きから", style = MaterialTheme.typography.titleMedium)
+                }
+                item {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(continueItems) { item ->
+                            Card(
+                                modifier = Modifier
+                                    .width(210.dp)
+                                    .clickable { onOpenRecent(item) }
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        when (item.type) {
+                                            RECENT_TYPE_MANGA -> "マンガ"
+                                            RECENT_TYPE_VIDEO -> "ビデオ"
+                                            else -> "音声"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        item.name.substringBeforeLast('.'),
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                    when (item.type) {
+                                        RECENT_TYPE_MANGA -> {
+                                            val pageCount = readingProgress.getInt(
+                                                pageCountKey(item.key), 0
+                                            )
+                                            val page = readingProgress.getInt(
+                                                pageKey(item.key), 0
+                                            )
+                                            savedProgressLabel(readingProgress, item.key)
+                                                ?.let { label ->
+                                                    Text(
+                                                        label,
+                                                        style = MaterialTheme.typography.bodySmall
+                                                    )
+                                                }
+                                            if (pageCount > 0) {
+                                                LinearProgressIndicator(
+                                                    progress = {
+                                                        (page + 1).toFloat() / pageCount.toFloat()
+                                                    },
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                            }
+                                        }
+                                        RECENT_TYPE_VIDEO -> {
+                                            val position = videoProgress.getLong(
+                                                videoProgressKey(item.key), 0L
+                                            )
+                                            if (position > 0L) {
+                                                Text(
+                                                    "続きから ${formatPlaybackTime(position)}",
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            TextButton(
-                onClick = onForgetCredentials,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(if (hasSavedCredentials) "保存情報を削除して切断" else "NASから切断")
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MediaSection.entries.chunked(2).forEach { rowSections ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            rowSections.forEach { section ->
+                                Card(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(120.dp)
+                                        .clickable { onSelect(section) }
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(16.dp),
+                                        verticalArrangement = Arrangement.Center
+                                    ) {
+                                        Text(
+                                            section.title,
+                                            style = MaterialTheme.typography.titleLarge
+                                        )
+                                        Text(
+                                            section.description,
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                    }
+                                }
+                            }
+                            if (rowSections.size == 1) {
+                                Box(modifier = Modifier.weight(1f))
+                            }
+                        }
+                    }
+                }
             }
+            if (recentItems.isNotEmpty()) {
+                item {
+                    Text("最近開いた", style = MaterialTheme.typography.titleMedium)
+                }
+                item {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(recentItems) { item ->
+                            Card(
+                                modifier = Modifier
+                                    .width(170.dp)
+                                    .clickable { onOpenRecent(item) }
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        when (item.type) {
+                                            RECENT_TYPE_MANGA -> "マンガ"
+                                            RECENT_TYPE_VIDEO -> "ビデオ"
+                                            else -> "音声"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        item.name.substringBeforeLast('.'),
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            item {
+                HorizontalDivider()
+                Text("ストレージ", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "マンガキャッシュ：${formatFileSize(mangaCacheSize)}",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                TextButton(
+                    onClick = onClearMangaCache,
+                    enabled = mangaCacheSize > 0L
+                ) {
+                    Text("キャッシュを削除")
+                }
+            }
+            item {
+                TextButton(
+                    onClick = onForgetCredentials,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (hasSavedCredentials) "保存情報を削除して切断" else "NASから切断")
+                }
+            }
+        }
+        bottomBar()
         }
     }
 }
@@ -2282,615 +2615,6 @@ private fun MangaReaderScreen(
                     }
                 }
             )
-        }
-    }
-}
-
-private fun loadAudioEntries(
-    server: String, username: String, password: String, path: String
-): List<AudioEntry> = withDiskShare(server, username, password, "Voice") { share ->
-    share.list(path).asSequence()
-        .filterNot { it.fileName == "." || it.fileName == ".." }
-        .mapNotNull { info ->
-            val directory = info.fileAttributes and FileAttributes.FILE_ATTRIBUTE_DIRECTORY.value != 0L
-            val audio = info.fileName.substringAfterLast('.', "").lowercase() in AUDIO_EXTENSIONS
-            if (!directory && !audio) return@mapNotNull null
-            AudioEntry(info.fileName, joinSmbPath(path, info.fileName), directory)
-        }
-        .sortedWith { left, right ->
-            when {
-                left.isDirectory && !right.isDirectory -> -1
-                !left.isDirectory && right.isDirectory -> 1
-                else -> compareNaturally(left.name, right.name)
-            }
-        }.toList()
-}
-
-private fun resolveAudioDirectory(
-    server: String,
-    username: String,
-    password: String,
-    initialPath: String
-): ResolvedAudioDirectory {
-    var path = initialPath
-    repeat(MAX_AUDIO_AUTO_ADVANCE_DEPTH) {
-        val entries = loadAudioEntries(server, username, password, path)
-        val onlyEntry = entries.singleOrNull()
-        if (onlyEntry == null || !onlyEntry.isDirectory) {
-            return ResolvedAudioDirectory(path, entries)
-        }
-        path = onlyEntry.path
-    }
-    return ResolvedAudioDirectory(
-        path = path,
-        entries = loadAudioEntries(server, username, password, path)
-    )
-}
-
-internal fun loadAudioCoverBitmap(
-    server: String,
-    username: String,
-    password: String,
-    folderPath: String,
-    cacheDirectory: LocalFile
-): Bitmap? = withDiskShare(server, username, password, "Voice") { share ->
-    val candidates = share.list(folderPath)
-        .filterNot { it.fileName == "." || it.fileName == ".." }
-        .filter { it.fileName.substringAfterLast('.', "").lowercase() in PHOTO_EXTENSIONS }
-        .sortedBy { info ->
-            val name = info.fileName.substringBeforeLast('.').lowercase()
-            when (name) {
-                "cover" -> 0
-                "folder" -> 1
-                "front" -> 2
-                else -> 3
-            }
-        }
-    val cover = candidates.firstOrNull() ?: return@withDiskShare null
-    val remotePath = joinSmbPath(folderPath, cover.fileName)
-    val info = share.getFileInformation(remotePath)
-    val size = info.standardInformation.endOfFile
-    val cacheFolder = LocalFile(cacheDirectory, "audio-cover-cache").apply { mkdirs() }
-    val cached = LocalFile(cacheFolder, "cover-${remotePath.hashCode()}")
-    if (!cached.isFile || cached.length() != size) {
-        downloadRemoteFile(share, remotePath, cached, size)
-    }
-    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(cached.absolutePath, bounds)
-    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@withDiskShare null
-    BitmapFactory.decodeFile(cached.absolutePath, BitmapFactory.Options().apply {
-        inSampleSize = calculateSampleSize(bounds.outWidth, bounds.outHeight, 1400)
-    })
-}
-
-private fun loadVideoEntries(
-    server: String,
-    username: String,
-    password: String,
-    path: String
-): List<VideoEntry> = withDiskShare(server, username, password, "video") { share ->
-    share.list(path)
-        .asSequence()
-        .filterNot { it.fileName == "." || it.fileName == ".." }
-        .mapNotNull { information ->
-            val isDirectory = information.fileAttributes and
-                FileAttributes.FILE_ATTRIBUTE_DIRECTORY.value != 0L
-            val isVideo = information.fileName.substringAfterLast('.', "")
-                .lowercase() in VIDEO_EXTENSIONS
-            if (!isDirectory && !isVideo) return@mapNotNull null
-            VideoEntry(
-                name = information.fileName,
-                path = joinSmbPath(path, information.fileName),
-                isDirectory = isDirectory
-            )
-        }
-        .sortedWith { left, right ->
-            when {
-                left.isDirectory && !right.isDirectory -> -1
-                !left.isDirectory && right.isDirectory -> 1
-                else -> compareNaturally(left.name, right.name)
-            }
-        }
-        .toList()
-}
-
-private fun loadPhotoEntries(
-    server: String,
-    username: String,
-    password: String,
-    path: String
-): List<PhotoEntry> = withDiskShare(server, username, password, "Picture") { share ->
-    share.list(path)
-        .asSequence()
-        .filterNot { it.fileName == "." || it.fileName == ".." }
-        .mapNotNull { information ->
-            val isDirectory = information.fileAttributes and
-                FileAttributes.FILE_ATTRIBUTE_DIRECTORY.value != 0L
-            val isPhoto = information.fileName.substringAfterLast('.', "")
-                .lowercase() in PHOTO_EXTENSIONS
-            if (!isDirectory && !isPhoto) return@mapNotNull null
-            PhotoEntry(
-                name = information.fileName,
-                path = joinSmbPath(path, information.fileName),
-                isDirectory = isDirectory
-            )
-        }
-        .sortedWith { left, right ->
-            when {
-                left.isDirectory && !right.isDirectory -> -1
-                !left.isDirectory && right.isDirectory -> 1
-                else -> compareNaturally(left.name, right.name)
-            }
-        }
-        .toList()
-}
-
-private fun loadPhotoBitmap(
-    server: String,
-    username: String,
-    password: String,
-    photoPath: String,
-    cacheDirectory: LocalFile,
-    maxSide: Int = 2560
-): Bitmap = withDiskShare(server, username, password, "Picture") { share ->
-    val information = share.getFileInformation(photoPath)
-    val remoteSize = information.standardInformation.endOfFile
-    val remoteModified = information.basicInformation.lastWriteTime.toEpochMillis()
-    val photoCache = LocalFile(cacheDirectory, "photo-cache").apply { mkdirs() }
-    val cachedPhoto = LocalFile(photoCache, "photo-${photoPath.hashCode()}")
-
-    if (!cachedPhoto.isFile ||
-        cachedPhoto.length() != remoteSize ||
-        cachedPhoto.lastModified() != remoteModified
-    ) {
-        downloadRemoteFile(share, photoPath, cachedPhoto, remoteSize)
-        cachedPhoto.setLastModified(remoteModified)
-    }
-
-    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(cachedPhoto.absolutePath, bounds)
-    require(bounds.outWidth > 0 && bounds.outHeight > 0) { "写真を読み取れません" }
-
-    // サムネイル表示では縮小済み画像をディスクに残し、次回は元画像を開かずに済ませる
-    val thumbFile = if (maxSide <= 500) {
-        val thumbDir = LocalFile(cacheDirectory, "photo-thumb-cache").apply { mkdirs() }
-        LocalFile(thumbDir, "thumb-${photoPath.hashCode()}-$maxSide.jpg")
-    } else {
-        null
-    }
-    if (thumbFile != null && thumbFile.isFile && thumbFile.length() > 0L) {
-        BitmapFactory.decodeFile(thumbFile.absolutePath)
-            ?.let { return@withDiskShare it }
-    }
-
-    val options = BitmapFactory.Options().apply {
-        inSampleSize = calculateSampleSize(bounds.outWidth, bounds.outHeight, maxSide)
-    }
-    val decoded = BitmapFactory.decodeFile(cachedPhoto.absolutePath, options)
-        ?: error("写真を読み取れません")
-    if (thumbFile != null) {
-        runCatching {
-            thumbFile.outputStream().use { output ->
-                decoded.compress(Bitmap.CompressFormat.JPEG, 82, output)
-            }
-        }
-    }
-    decoded
-}
-
-private fun joinSmbPath(parent: String, child: String): String {
-    return if (parent.isEmpty()) child else "$parent\\$child"
-}
-
-private fun parentSmbPath(path: String): String = path.substringBeforeLast('\\', "")
-
-private fun photoFileName(path: String): String = path.substringAfterLast('\\')
-
-private fun loadMangaZipNames(
-    server: String,
-    username: String,
-    password: String
-): List<String> = withMangaShare(server, username, password) { share ->
-    share.list("")
-        .map { it.fileName }
-        .filter { it.endsWith(".zip", ignoreCase = true) }
-        .sortedWith(String.CASE_INSENSITIVE_ORDER)
-}
-
-private fun downloadAndOpenManga(
-    server: String,
-    username: String,
-    password: String,
-    zipName: String,
-    cacheDirectory: LocalFile,
-    cacheMetadata: SharedPreferences,
-    onProgress: ((Long, Long) -> Unit)? = null,
-    downloadControl: DownloadControl? = null
-): MangaBook {
-    val previewDirectory = LocalFile(cacheDirectory, "manga-preview").apply { mkdirs() }
-    val cachedZip = LocalFile(previewDirectory, "${zipName.hashCode()}.zip")
-
-    return withMangaShare(server, username, password) { share ->
-        val information = share.getFileInformation(zipName)
-        val remoteSize = information.standardInformation.endOfFile
-        val remoteModified = information.basicInformation.lastWriteTime.toEpochMillis()
-        val cacheIsCurrent = cachedZip.isFile &&
-            cachedZip.length() == remoteSize &&
-            cacheMetadata.getLong(cacheSizeKey(zipName), -1L) == remoteSize &&
-            cacheMetadata.getLong(cacheModifiedKey(zipName), -1L) == remoteModified
-
-        var downloadedNow = false
-        if (!cacheIsCurrent) {
-            downloadZip(share, zipName, cachedZip, remoteSize, onProgress, downloadControl)
-            saveCacheMetadata(cacheMetadata, zipName, remoteSize, remoteModified)
-            downloadedNow = true
-        }
-
-        runCatching {
-            readMangaBook(cachedZip, zipName)
-        }.recoverCatching {
-            if (downloadedNow) throw it
-            cachedZip.delete()
-            downloadZip(share, zipName, cachedZip, remoteSize, onProgress, downloadControl)
-            saveCacheMetadata(cacheMetadata, zipName, remoteSize, remoteModified)
-            readMangaBook(cachedZip, zipName)
-        }.getOrThrow()
-    }
-}
-
-private fun downloadZip(
-    share: DiskShare,
-    zipName: String,
-    destination: LocalFile,
-    expectedSize: Long,
-    onProgress: ((Long, Long) -> Unit)? = null,
-    downloadControl: DownloadControl? = null
-) {
-    downloadRemoteFile(share, zipName, destination, expectedSize, onProgress, downloadControl)
-}
-
-private fun downloadRemoteFile(
-    share: DiskShare,
-    remotePath: String,
-    destination: LocalFile,
-    expectedSize: Long,
-    onProgress: ((Long, Long) -> Unit)? = null,
-    downloadControl: DownloadControl? = null
-) {
-    val partialFile = LocalFile(destination.parentFile, "${destination.name}.part")
-    partialFile.delete()
-    try {
-        share.openFile(
-            remotePath,
-            EnumSet.of(AccessMask.GENERIC_READ),
-            EnumSet.noneOf(FileAttributes::class.java),
-            EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ),
-            SMB2CreateDisposition.FILE_OPEN,
-            EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE)
-        ).use { remoteFile ->
-            remoteFile.inputStream.use { input ->
-                partialFile.outputStream().use { output ->
-                    val buffer = ByteArray(256 * 1024)
-                    var copied = 0L
-                    while (true) {
-                        if (downloadControl?.cancelled == true) {
-                            throw CancellationException("ダウンロードをキャンセルしました")
-                        }
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        output.write(buffer, 0, read)
-                        copied += read.toLong()
-                        onProgress?.invoke(copied, expectedSize)
-                    }
-                }
-            }
-        }
-        require(partialFile.length() == expectedSize) { "ファイルの取得が完了していません" }
-        destination.delete()
-        require(partialFile.renameTo(destination)) { "キャッシュを保存できません" }
-    } finally {
-        partialFile.delete()
-    }
-}
-
-private fun readMangaBook(zip: LocalFile, zipName: String): MangaBook {
-    return runCatching {
-        readMangaBook(zip, zipName, StandardCharsets.UTF_8)
-    }.recoverCatching {
-        readMangaBook(zip, zipName, Charset.forName("MS932"))
-    }.getOrThrow()
-}
-
-private fun readMangaBook(
-    zip: LocalFile,
-    zipName: String,
-    charset: Charset
-): MangaBook {
-    ZipFile(zip, charset).use { archive ->
-        val pageNames = archive.entries().asSequence()
-            .filterNot { it.isDirectory }
-            .filter { entry ->
-                val extension = entry.name.substringAfterLast('.', "").lowercase()
-                extension in setOf("jpg", "jpeg", "png", "webp")
-            }
-            .map { it.name }
-            .sortedWith(::compareNaturally)
-            .toList()
-        require(pageNames.isNotEmpty()) { "ZIP内に対応画像がありません" }
-        return MangaBook(zipName, zip, pageNames, charset)
-    }
-}
-
-private fun readPage(book: MangaBook, pageIndex: Int, maxSide: Int = 2048): Bitmap {
-    ZipFile(book.cachedZip, book.charset).use { archive ->
-        val entry = archive.getEntry(book.pageNames[pageIndex])
-            ?: error("ページが見つかりません")
-
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        archive.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, bounds) }
-        require(bounds.outWidth > 0 && bounds.outHeight > 0) { "画像を読み取れません" }
-
-        val options = BitmapFactory.Options().apply {
-            inSampleSize = calculateSampleSize(bounds.outWidth, bounds.outHeight, maxSide)
-        }
-        val bitmap = archive.getInputStream(entry).use {
-            BitmapFactory.decodeStream(it, null, options)
-        } ?: error("画像を読み取れません")
-        return bitmap
-    }
-}
-
-private fun loadCachedMangaThumbnail(
-    cacheDirectory: LocalFile,
-    zipName: String
-): Bitmap? {
-    val cachedZip = LocalFile(LocalFile(cacheDirectory, "manga-preview"), "${zipName.hashCode()}.zip")
-    if (!cachedZip.isFile) return null
-    return runCatching {
-        val book = readMangaBook(cachedZip, zipName)
-        readPage(book, 0, maxSide = 480)
-    }.getOrNull()
-}
-
-private fun compareNaturally(left: String, right: String): Int {
-    val leftParts = NATURAL_SORT_PARTS.findAll(left.lowercase()).map { it.value }.toList()
-    val rightParts = NATURAL_SORT_PARTS.findAll(right.lowercase()).map { it.value }.toList()
-    val commonSize = minOf(leftParts.size, rightParts.size)
-
-    for (index in 0 until commonSize) {
-        val leftPart = leftParts[index]
-        val rightPart = rightParts[index]
-        val comparison = if (leftPart.all(Char::isDigit) && rightPart.all(Char::isDigit)) {
-            leftPart.trimStart('0').ifEmpty { "0" }.let { normalizedLeft ->
-                rightPart.trimStart('0').ifEmpty { "0" }.let { normalizedRight ->
-                    normalizedLeft.length.compareTo(normalizedRight.length)
-                        .takeIf { it != 0 }
-                        ?: normalizedLeft.compareTo(normalizedRight)
-                }
-            }
-        } else {
-            leftPart.compareTo(rightPart)
-        }
-        if (comparison != 0) return comparison
-    }
-    return leftParts.size.compareTo(rightParts.size)
-}
-
-private val NATURAL_SORT_PARTS = Regex("\\d+|\\D+")
-private val PHOTO_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "heic", "heif")
-private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "webm", "mov", "m4v", "avi")
-private val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "flac", "ogg", "opus", "wav")
-private const val MAX_AUDIO_AUTO_ADVANCE_DEPTH = 12
-private const val SWIPE_THRESHOLD_PX = 80f
-private const val READING_PROGRESS_PREFERENCES = "reading_progress"
-private const val MANGA_CACHE_PREFERENCES = "manga_cache_metadata"
-private const val VIDEO_PROGRESS_PREFERENCES = "video_progress"
-private const val RECENT_PREFERENCES = "recently_opened"
-private const val RECENT_ITEMS_KEY = "items"
-private const val MAX_RECENT_ITEMS = 20
-private const val RECENT_TYPE_MANGA = "MANGA"
-private const val RECENT_TYPE_VIDEO = "VIDEO"
-private const val RECENT_TYPE_AUDIO = "AUDIO"
-private const val TITLE_AND_GUIDE_VISIBLE_MILLIS = 3_000L
-private const val TITLE_AND_GUIDE_FADE_MILLIS = 700
-private const val VIDEO_PROGRESS_SAVE_INTERVAL_MILLIS = 5_000L
-private const val VIDEO_COMPLETION_MARGIN_MILLIS = 10_000L
-
-private fun pageKey(zipName: String) = "page:$zipName"
-
-private fun pageCountKey(zipName: String) = "page_count:$zipName"
-
-private fun cacheSizeKey(zipName: String) = "size:$zipName"
-
-private fun cacheModifiedKey(zipName: String) = "modified:$zipName"
-
-private fun videoProgressKey(videoPath: String) = "position:$videoPath"
-
-private fun saveVideoProgress(
-    preferences: SharedPreferences,
-    videoPath: String,
-    player: Player
-) {
-    val position = player.currentPosition.coerceAtLeast(0L)
-    val duration = player.duration
-    val isNearEnd = duration > 0L &&
-        duration != androidx.media3.common.C.TIME_UNSET &&
-        duration - position <= VIDEO_COMPLETION_MARGIN_MILLIS
-    if (isNearEnd || player.playbackState == Player.STATE_ENDED || position < 1_000L) {
-        preferences.edit().remove(videoProgressKey(videoPath)).apply()
-    } else {
-        preferences.edit().putLong(videoProgressKey(videoPath), position).apply()
-    }
-}
-
-private fun formatPlaybackTime(positionMillis: Long): String {
-    val totalSeconds = positionMillis / 1_000L
-    val hours = totalSeconds / 3_600L
-    val minutes = (totalSeconds % 3_600L) / 60L
-    val seconds = totalSeconds % 60L
-    return if (hours > 0L) {
-        "%d:%02d:%02d".format(hours, minutes, seconds)
-    } else {
-        "%d:%02d".format(minutes, seconds)
-    }
-}
-
-private fun saveCacheMetadata(
-    preferences: SharedPreferences,
-    zipName: String,
-    size: Long,
-    modified: Long
-) {
-    preferences.edit()
-        .putLong(cacheSizeKey(zipName), size)
-        .putLong(cacheModifiedKey(zipName), modified)
-        .apply()
-}
-
-private fun savedPage(preferences: SharedPreferences, zipName: String): Int {
-    return preferences.getInt(pageKey(zipName), 0)
-}
-
-private fun savedProgressLabel(
-    preferences: SharedPreferences,
-    zipName: String
-): String? {
-    if (!preferences.contains(pageKey(zipName))) return null
-    val page = preferences.getInt(pageKey(zipName), 0) + 1
-    val pageCount = preferences.getInt(pageCountKey(zipName), 0)
-    return if (pageCount > 0) {
-        "続きから：$page / $pageCount"
-    } else {
-        "続きから：${page}ページ"
-    }
-}
-
-private fun calculateSampleSize(width: Int, height: Int, maxSide: Int): Int {
-    var sampleSize = 1
-    while (width / sampleSize > maxSide || height / sampleSize > maxSide) {
-        sampleSize *= 2
-    }
-    return sampleSize
-}
-
-private fun classifyNasConnectionError(error: Throwable): String {
-    val details = generateSequence(error) { it.cause }
-        .flatMap { throwable ->
-            sequenceOf(throwable.javaClass.name, throwable.message.orEmpty())
-        }
-        .joinToString(" ")
-        .lowercase()
-    return when {
-        details.contains("logon_failure") || details.contains("logon failure") ||
-            details.contains("access_denied") || details.contains("access denied") ||
-            details.contains("authentication") || details.contains("ntlm") ||
-            details.contains("パスワード") ->
-            "認証に失敗しました。ユーザー名とパスワードを確認してください"
-        details.contains("bad_network_name") || details.contains("bad network name") ||
-            details.contains("object_name_not_found") || details.contains("object name not found") ||
-            details.contains("object_path_not_found") || details.contains("no such file") ||
-            details.contains("share") && details.contains("not found") ->
-            "共有フォルダが見つかりません。NASの共有フォルダ（Manga）を確認してください"
-        details.contains("unknownhost") || details.contains("timed out") ||
-            details.contains("timeout") || details.contains("connectexception") ||
-            details.contains("noroutetohost") || details.contains("unreachable") ||
-            details.contains("ehostunreach") || details.contains("etimedout") ||
-            details.contains("connection refused") || details.contains("failed to connect") ->
-            "NASに接続できません。NASの電源とIPアドレス、同じネットワークに接続しているか確認してください"
-        else -> "接続できません。NASとネットワークの状態を確認してください"
-    }
-}
-
-private fun recordRecentItem(
-    preferences: SharedPreferences,
-    type: String,
-    key: String,
-    name: String
-) {
-    val sanitizedKey = key.replace('\t', ' ').replace('\n', ' ')
-    val sanitizedName = name.replace('\t', ' ').replace('\n', ' ')
-    val current = loadRecentItems(preferences)
-        .filterNot { it.type == type && it.key == sanitizedKey }
-    val updated = (listOf(
-        RecentItem(type, sanitizedKey, sanitizedName, System.currentTimeMillis())
-    ) + current).take(MAX_RECENT_ITEMS)
-    preferences.edit()
-        .putString(
-            RECENT_ITEMS_KEY,
-            updated.joinToString("\n") { item ->
-                listOf(item.type, item.timestamp.toString(), item.key, item.name)
-                    .joinToString("\t")
-            }
-        )
-        .apply()
-}
-
-private fun loadRecentItems(preferences: SharedPreferences): List<RecentItem> {
-    val raw = preferences.getString(RECENT_ITEMS_KEY, null) ?: return emptyList()
-    return raw.split("\n").mapNotNull { line ->
-        val parts = line.split("\t")
-        if (parts.size < 4) return@mapNotNull null
-        RecentItem(
-            type = parts[0],
-            key = parts[2],
-            name = parts[3],
-            timestamp = parts[1].toLongOrNull() ?: 0L
-        )
-    }
-}
-
-private fun formatFileSize(bytes: Long): String {
-    if (bytes < 1024L) return "$bytes B"
-    val units = listOf("KB", "MB", "GB")
-    var value = bytes.toDouble() / 1024.0
-    var unitIndex = 0
-    while (value >= 1024.0 && unitIndex < units.lastIndex) {
-        value /= 1024.0
-        unitIndex++
-    }
-    return "%.1f %s".format(value, units[unitIndex])
-}
-
-private fun mangaCacheSizeBytes(cacheDirectory: LocalFile): Long {
-    val previewDirectory = LocalFile(cacheDirectory, "manga-preview")
-    if (!previewDirectory.isDirectory) return 0L
-    return previewDirectory.walkTopDown()
-        .filter { it.isFile }
-        .sumOf { it.length() }
-}
-
-private fun clearMangaCache(cacheDirectory: LocalFile, cacheMetadata: SharedPreferences) {
-    val previewDirectory = LocalFile(cacheDirectory, "manga-preview")
-    previewDirectory.listFiles()?.forEach { it.delete() }
-    cacheMetadata.edit().clear().apply()
-}
-
-private inline fun <T> withMangaShare(
-    server: String,
-    username: String,
-    password: String,
-    block: (DiskShare) -> T
-): T = withDiskShare(server, username, password, "Manga", block)
-
-private inline fun <T> withDiskShare(
-    server: String,
-    username: String,
-    password: String,
-    shareName: String,
-    block: (DiskShare) -> T
-): T {
-    SMBClient().use { client ->
-        client.connect(server).use { connection ->
-            val authentication = AuthenticationContext(
-                username,
-                password.toCharArray(),
-                null
-            )
-            connection.authenticate(authentication).use { session ->
-                (session.connectShare(shareName) as DiskShare).use { share ->
-                    return block(share)
-                }
-            }
         }
     }
 }
