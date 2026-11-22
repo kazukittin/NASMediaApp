@@ -45,11 +45,13 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.material3.Button
@@ -322,6 +324,7 @@ private fun NasConnectionScreen(
     var mangaDownloadPercent by remember { mutableStateOf(-1) }
     var mangaDownloadControl by remember { mutableStateOf<DownloadControl?>(null) }
     var mangaCacheSize by remember { mutableStateOf(0L) }
+    val mangaListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     val favoritesPreferences = remember {
         context.getSharedPreferences(FAVORITES_PREFERENCES, Context.MODE_PRIVATE)
     }
@@ -1135,6 +1138,7 @@ private fun NasConnectionScreen(
         }
 
         LazyColumn(
+            state = mangaListState,
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -1239,6 +1243,7 @@ private fun MediaHomeScreen(
     modifier: Modifier = Modifier,
     bottomBar: @Composable () -> Unit = {}
 ) {
+    val homeListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     Surface(
         modifier = modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background,
@@ -1246,6 +1251,7 @@ private fun MediaHomeScreen(
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
+            state = homeListState,
             modifier = Modifier
                 .weight(1f)
                 .windowInsetsPadding(WindowInsets.safeDrawing)
@@ -1561,6 +1567,7 @@ private fun AudioBrowserScreen(
     }
     var favorites by remember { mutableStateOf(loadFavorites(favoritesPreferences)) }
     var favOnly by remember(currentPath) { mutableStateOf(false) }
+    val listState = rememberSaveable(currentPath, saver = LazyListState.Saver) { LazyListState() }
     var metadataByPath by remember(currentPath) {
         mutableStateOf<Map<String, DlsiteWorkInfo>>(emptyMap())
     }
@@ -1608,6 +1615,7 @@ private fun AudioBrowserScreen(
                 label = { Text("お気に入りのみ") }
             )
             LazyColumn(
+                state = listState,
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
@@ -1995,6 +2003,7 @@ private fun VideoBrowserScreen(
     val context = LocalContext.current
     var query by rememberSaveable(currentPath) { mutableStateOf("") }
     var sort by rememberSaveable(currentPath) { mutableStateOf(LibrarySort.NAME_ASC) }
+    val listState = rememberSaveable(currentPath, saver = LazyListState.Saver) { LazyListState() }
     val videoProgress = remember {
         context.getSharedPreferences(VIDEO_PROGRESS_PREFERENCES, Context.MODE_PRIVATE)
     }
@@ -2068,6 +2077,7 @@ private fun VideoBrowserScreen(
                 )
             }
             LazyColumn(
+                state = listState,
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
@@ -2253,6 +2263,7 @@ private fun PhotoBrowserScreen(
     val thumbnailSemaphore = remember { Semaphore(3) }
     var query by rememberSaveable(currentPath) { mutableStateOf("") }
     var sort by rememberSaveable(currentPath) { mutableStateOf(LibrarySort.NAME_ASC) }
+    val gridState = rememberSaveable(currentPath, saver = LazyGridState.Saver) { LazyGridState() }
     val context = LocalContext.current
     val searchHistoryPreferences = remember {
         context.getSharedPreferences(SEARCH_HISTORY_PREFERENCES, Context.MODE_PRIVATE)
@@ -2307,6 +2318,7 @@ private fun PhotoBrowserScreen(
             LibrarySortControl(sort) { sort = it }
 
             LazyVerticalGrid(
+                state = gridState,
                 modifier = Modifier.weight(1f),
                 columns = GridCells.Adaptive(140.dp),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
